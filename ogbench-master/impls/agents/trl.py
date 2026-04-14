@@ -5,6 +5,37 @@ import jax
 import ml_collections
 from utils.flax_utils import nonpytree_field
 
+class TRLDataset:
+    
+    """ 
+    sample dataloader
+    """
+
+    def __init__(self, dataset):
+        """
+        pseudocode:
+        1. store observations and actions arrays
+        2. find trajectory boundaries from terminals
+           - ends = where terminals == 1
+           - starts = [0] + (ends[:-1] + 1)
+        3. store starts and lengths
+        """
+        raise NotImplementedError
+
+    def sample(self, batch_size, rng):
+        """
+        sample (i, j, k) triples for the TRL value loss
+
+        pseudocode:
+        1. pick random trajectories
+        2. sample i, then j > i, then k in [i, j-1]
+        3. index into observations/actions arrays
+        4. return dict:
+           - s_i, a_i, s_j, a_j, s_k, a_k
+           - leg1_len (k - i), leg2_len (j - k)
+        """
+        raise NotImplementedError
+
 
 class TRLAgent(flax.struct.PyTreeNode):
     """
