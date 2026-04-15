@@ -2,7 +2,9 @@ from typing import Any
 
 import flax
 import jax
+import jax.numpy as jnp
 import ml_collections
+import numpy as np
 from utils.flax_utils import nonpytree_field
 
 class TRLDataset:
@@ -20,7 +22,14 @@ class TRLDataset:
            - starts = [0] + (ends[:-1] + 1)
         3. store starts and lengths
         """
-        raise NotImplementedError
+        self.dataset = dataset
+        self.observations = dataset['observations']
+        self.actions = dataset['actions']
+        self.terminals = dataset['terminals']
+
+        (self.ends,) = np.nonzero(self.terminals == 1)
+        self.starts = np.concatenate([[0], self.ends[:-1] + 1])
+        self.lengths = self.ends - self.starts + 1
 
     def sample(self, batch_size, rng):
         """
@@ -34,7 +43,39 @@ class TRLDataset:
            - s_i, a_i, s_j, a_j, s_k, a_k
            - leg1_len (k - i), leg2_len (j - k)
         """
-        raise NotImplementedError
+        # step 1
+        traj_rng, i_rng, j_rng, k_rng = jax.random.split(rng, 4)
+        traj_idxs = np.asarray(jax.random.randint(traj_rng, (batch_size,), 0, len(self.starts)))
+        starts = self.starts[traj_idxs]
+        lengths = self.lengths[traj_idxs]
+
+        # step 2
+        max_i_offsets = np.maximum(lengths - 1, 1)
+        i_offsets = np.asarray(jax.random.uniform(i_rng, (batch_size,)) * max_i_offsets).astype(int)
+        i_idxs = starts + i_offsets
+
+        # step 2
+        remaining = lengths - i_offsets - 1
+        j_span = np.maximum(remaining, 1)
+        j_offsets = i_offsets + 1 + np.asarray(jax.random.uniform(j_rng, (batch_size,)) * j_span).astype(int)
+        j_idxs = starts + j_offsets
+        
+        # step 2
+        k_span = j_offsets - i_offsets
+        k_offsets = i_offsets + np.asarray(jax.random.uniform(k_rng, (batch_size,)) * k_span).astype(int)
+        k_idxs = starts + k_offsets
+
+        # steps 3/4
+        return {
+            's_i': self.observations[i_idxs],
+            'a_i': self.actions[i_idxs],
+            's_j': self.observations[j_idxs],
+            'a_j': self.actions[j_idxs],
+            's_k': self.observations[k_idxs],
+            'a_k': self.actions[k_idxs],
+            'leg1_len': k_idxs - i_idxs,
+            'leg2_len': j_idxs - k_idxs,
+        }
 
 
 class TRLAgent(flax.struct.PyTreeNode):
@@ -70,7 +111,12 @@ class TRLAgent(flax.struct.PyTreeNode):
         4. multiply the pointwise base loss by that weight
         5. return the weighted loss
         """
-        raise NotImplementedError('pseudocode only')
+        weight = 0.0
+        if pred > target:
+            weight = 1.0 - self.config['expectile']
+        else:
+            weight = self.config['expectile']
+        return weight * base_loss
 
     def sample_behavioral_subgoals(self, batch):
         """pick midpoint states only from the same trajectory.
@@ -131,7 +177,16 @@ class TRLAgent(flax.struct.PyTreeNode):
         3. if lambda == 0, just return 1 for every sample
         4. return the weights
         """
-        raise NotImplementedError('pseudocode only')
+        # step 3
+        lam = self.config['distance_weight_lambda']
+        if lam == 0.0:
+            return jnp.ones_like(critic_prediction)
+        # step 1 (ok so little funky but from looking it seems you want to log transform in most cases?)
+        # like supposedly we want super long horizon to shrink weight exponentially but can change this
+        estimated_distance = -jnp.log(jnp.clip(critic_prediction, a_min=1e-8, a_max=1.0))
+        # step 2
+        w = 1.0 / (1.0 + estimated_distance) ** lam
+        return w
 
     def critic_loss(self, batch, grad_params):
         """main TRL critic objective.
@@ -186,7 +241,23 @@ class TRLAgent(flax.struct.PyTreeNode):
         1. get actor and critic losses from functions
         2. do appropriate dimensioning and summing and return
         """
-        raise NotImplementedError('pseudocode only')
+        info = {}
+        rng = rng if rng is not None else self.rng
+
+        #step 1
+        critic_loss, critic_info = self.critic_loss(batch, grad_params)
+        for k, v in critic_info.items():
+            # the slash is arbitrary but use when indexing (ie critic/loss)
+            info[f'critic/{k}'] = v
+
+        rng, actor_rng = jax.random.split(rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        for k, v in actor_info.items():
+            info[f'actor/{k}'] = v
+
+        # step 2
+        loss = self.config['critic_loss_weight'] * critic_loss + self.config['actor_loss_weight'] * actor_loss
+        return loss, info
 
     def target_update(self, network, module_name):
         """update the target critic.
@@ -203,7 +274,21 @@ class TRLAgent(flax.struct.PyTreeNode):
         3. blend them with tau
         4. write the new target params
         """
-        raise NotImplementedError('pseudocode only')
+
+        def polyak_average(p, tp):
+            return p * self.config['tau'] + tp * (1 - self.config['tau'])
+
+        # ok i'm probably messing up this jax/parameters thing since had to be googling
+        new_target_params = jax.tree_util.tree_map(
+            # step 3
+            polyak_average,
+            # step 1 (the current critic weights)
+            self.network.params[f'modules_{module_name}'],
+            # step 2 (lagged copy for stability)
+            self.network.params[f'modules_target_{module_name}'],
+        )
+        # step 4
+        network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
     def update(self, batch):
@@ -215,12 +300,24 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         pseudocode:
         1. split rng
-        2. save batch
-        3. run one optimizer step on the network params
-        4. update the target critic
-        5. return the new agent & log stuff
+        2. run one optimizer step on the network params
+        3. update the target critic
+        4. return the new agent & log stuff
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        new_rng, rng = jax.random.split(self.rng)
+
+        def loss_fn(grad_params):
+            return self.total_loss(batch, grad_params, rng=rng)
+
+        # step 2
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+
+        # step 3
+        self.target_update(new_network, 'critic')
+
+        # step 4
+        return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
     def sample_actions(
@@ -241,7 +338,14 @@ class TRLAgent(flax.struct.PyTreeNode):
         2. sample or take the mode
         3. clip continuous actions if needed
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        # step 2
+        actions = dist.sample(seed=seed)
+        # step 3
+        if not self.config['discrete']:
+            actions = jnp.clip(actions, -1, 1)
+        return actions
 
     @classmethod
     def create(
