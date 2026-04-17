@@ -1,82 +1,15 @@
 from typing import Any
 
+import copy
 import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
 import numpy as np
-from utils.flax_utils import nonpytree_field
-
-class TRLDataset:
-    
-    """ 
-    sample dataloader
-    """
-
-    def __init__(self, dataset):
-        """
-        pseudocode:
-        1. store observations and actions arrays
-        2. find trajectory boundaries from terminals
-           - ends = where terminals == 1
-           - starts = [0] + (ends[:-1] + 1)
-        3. store starts and lengths
-        """
-        self.dataset = dataset
-        self.observations = dataset['observations']
-        self.actions = dataset['actions']
-        self.terminals = dataset['terminals']
-
-        (self.ends,) = np.nonzero(self.terminals == 1)
-        self.starts = np.concatenate([[0], self.ends[:-1] + 1])
-        self.lengths = self.ends - self.starts + 1
-
-    def sample(self, batch_size, rng):
-        """
-        sample (i, j, k) triples for the TRL value loss
-
-        pseudocode:
-        1. pick random trajectories
-        2. sample i, then j > i, then k in [i, j-1]
-        3. index into observations/actions arrays
-        4. return dict:
-           - s_i, a_i, s_j, a_j, s_k, a_k
-           - leg1_len (k - i), leg2_len (j - k)
-        """
-        # step 1
-        traj_rng, i_rng, j_rng, k_rng = jax.random.split(rng, 4)
-        traj_idxs = np.asarray(jax.random.randint(traj_rng, (batch_size,), 0, len(self.starts)))
-        starts = self.starts[traj_idxs]
-        lengths = self.lengths[traj_idxs]
-
-        # step 2
-        max_i_offsets = np.maximum(lengths - 1, 1)
-        i_offsets = np.asarray(jax.random.uniform(i_rng, (batch_size,)) * max_i_offsets).astype(int)
-        i_idxs = starts + i_offsets
-
-        # step 2
-        remaining = lengths - i_offsets - 1
-        j_span = np.maximum(remaining, 1)
-        j_offsets = i_offsets + 1 + np.asarray(jax.random.uniform(j_rng, (batch_size,)) * j_span).astype(int)
-        j_idxs = starts + j_offsets
-        
-        # step 2
-        k_span = j_offsets - i_offsets
-        k_offsets = i_offsets + np.asarray(jax.random.uniform(k_rng, (batch_size,)) * k_span).astype(int)
-        k_idxs = starts + k_offsets
-
-        # steps 3/4
-        return {
-            's_i': self.observations[i_idxs],
-            'a_i': self.actions[i_idxs],
-            's_j': self.observations[j_idxs],
-            'a_j': self.actions[j_idxs],
-            's_k': self.observations[k_idxs],
-            'a_k': self.actions[k_idxs],
-            'leg1_len': k_idxs - i_idxs,
-            'leg2_len': j_idxs - k_idxs,
-        }
-
+import optax
+from utils.encoders import GCEncoder, encoder_modules
+from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
 
 class TRLAgent(flax.struct.PyTreeNode):
     """
@@ -111,35 +44,9 @@ class TRLAgent(flax.struct.PyTreeNode):
         4. multiply the pointwise base loss by that weight
         5. return the weighted loss
         """
-        weight = 0.0
-        if pred > target:
-            weight = 1.0 - self.config['expectile']
-        else:
-            weight = self.config['expectile']
+        # kind of a one liner so can pull into other if necessary just thought good to have func for each loss type
+        weight = jnp.where(pred > target, 1.0 - self.config['expectile'], self.config['expectile'])
         return weight * base_loss
-
-    def sample_behavioral_subgoals(self, batch):
-        """pick midpoint states only from the same trajectory.
-
-        paper reference:
-        - section 4.2 says TRL only considers in-trajectory states as subgoals
-        - need for stability random subgoals don't work
-        - algorithm 1 samples i <= k <= j from the same trajectory chunk
-
-        pseudocode:
-        1. read a trajectory chunk (s_i, a_i, ..., s_j) from the batch
-        2. sample an index k such that i <= k <= j
-        3. set the subgoal state to s_k
-        4. set the subgoal action to a_k when the q-based update needs it
-        5. also keep track of the chunk lengths:
-           - first leg length: k - i
-           - second leg length: j - k
-        6. return all of that
-
-        ** note: might need to add something to datasets.py since idk if can do this
-        type of sampling w normie OGBench
-        """
-        raise NotImplementedError('pseudocode only')
 
     def transitive_target(self, batch):
         """build the TRL target from two trajectory segments.
@@ -158,9 +65,44 @@ class TRLAgent(flax.struct.PyTreeNode):
            - if j-k <= 1, use gamma^(j-k)
            - else evaluate the target critic on (s_k, a_k, s_j)
         4. multiply the two leg values together
-        6. return the target
+        5. return the target
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        subgoal_batch = batch
+
+        # see other agents, take more conservative estimate
+        def reduce_critic_output(values):
+            if values.ndim > subgoal_batch['leg1_len'].ndim:
+                return jnp.min(values, axis=0)
+            return values
+
+        # step 2
+        discount = self.config['discount']
+        first_leg_bootstrap = self.network.select('target_critic')(
+            subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
+        )
+        first_leg_bootstrap = reduce_critic_output(first_leg_bootstrap)
+        # edge condition k - i <= 1
+        first_leg = jnp.where(
+            subgoal_batch['leg1_len'] <= 1,
+            discount ** subgoal_batch['leg1_len'],
+            first_leg_bootstrap,
+        )
+
+        # step 3
+        second_leg_bootstrap = self.network.select('target_critic')(
+            subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
+        )
+        second_leg_bootstrap = reduce_critic_output(second_leg_bootstrap)
+        # edge condition j-k <= 1
+        second_leg = jnp.where(
+            subgoal_batch['leg2_len'] <= 1,
+            discount ** subgoal_batch['leg2_len'],
+            second_leg_bootstrap,
+        )
+
+        # step 4/5
+        return first_leg * second_leg
 
     def distance_weight(self, critic_prediction):
         """reweight samples so short chunks matter more b/c get bad cumluating bias if don't
@@ -208,7 +150,38 @@ class TRLAgent(flax.struct.PyTreeNode):
         7. average across the batch and return
 
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        # probably debug this later not sure if we should be outputting logits but i think so with BCE?
+        critic_logits = self.network.select('critic')(batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params)
+        if critic_logits.ndim > batch['leg1_len'].ndim:
+            critic_logits = jnp.min(critic_logits, axis=0)
+        critic_prediction = jax.nn.sigmoid(critic_logits)
+
+        # step 2
+        target = self.transitive_target(batch)
+
+        # step 3
+        base_loss = optax.sigmoid_binary_cross_entropy(critic_logits, target)
+
+        # step 4
+        expectile_loss = self.expectile_loss(critic_prediction, target, base_loss)
+
+        # step 5
+        sample_weights = self.distance_weight(critic_prediction)
+
+        # steps 6/7
+        critic_loss = (expectile_loss * sample_weights).mean()
+
+        return critic_loss, {
+            'critic_loss': critic_loss,
+            'pred_mean': critic_prediction.mean(),
+            'pred_max': critic_prediction.max(),
+            'pred_min': critic_prediction.min(),
+            'target_mean': target.mean(),
+            'target_max': target.max(),
+            'target_min': target.min(),
+            'weight_mean': sample_weights.mean(),
+        }
 
     def actor_loss(self, batch, grad_params, rng=None):
         """policy extraction objective.
@@ -226,7 +199,35 @@ class TRLAgent(flax.struct.PyTreeNode):
         4. maximize that objective, or equivalently minimize its negative
         5. return the actor loss and logging stats
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        dist = self.network.select('actor')(
+            batch['s_i'], batch['s_j'], params=grad_params
+        )
+        rng = rng if rng is not None else self.rng
+        actions = dist.sample(seed=rng)
+
+        # step 2
+        q_vals = self.network.select('critic')(
+            batch['s_i'], batch['s_j'], actions, params=grad_params
+        )
+        # again take min? this can change but want conservative updates
+        if q_vals.ndim > batch['leg1_len'].ndim:
+            q_vals = jnp.min(q_vals, axis=0)
+
+        # step 3/4: log prob
+        log_prob = dist.log_prob(actions)
+        alpha = self.config['alpha']
+        objective = q_vals + alpha * log_prob
+
+        # step 5
+        actor_loss = -objective.mean()
+        return actor_loss, {
+            'actor_loss': actor_loss,
+            'q_mean': q_vals.mean(),
+            'q_max': q_vals.max(),
+            'q_min': q_vals.min(),
+            'log_prob_mean': log_prob.mean(),
+        }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -375,7 +376,79 @@ class TRLAgent(flax.struct.PyTreeNode):
         6. create the optimizer state
         7. return the agent
         """
-        raise NotImplementedError('pseudocode only')
+        # step 1
+        rng = jax.random.PRNGKey(seed)
+        rng, init_rng = jax.random.split(rng, 2)
+
+        # step 2
+        ex_goals = ex_observations
+        if config['discrete']:
+            action_dim = ex_actions.max() + 1
+        else:
+            action_dim = ex_actions.shape[-1]
+
+        # step 3
+        encoders = dict()
+        if config['encoder'] is not None:
+            encoder_module = encoder_modules[config['encoder']]
+            encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
+            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+
+        # step 4a (not positive if all required args here?)
+        if config['discrete']:
+            critic_def = GCDiscreteCritic(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                gc_encoder=encoders.get('critic'),
+                action_dim=action_dim,
+            )
+        else:
+            critic_def = GCValue(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                gc_encoder=encoders.get('critic'),
+            )
+
+        # step 4c
+        if config['discrete']:
+            actor_def = GCDiscreteActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                gc_encoder=encoders.get('actor'),
+            )
+        else:
+            actor_def = GCActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                state_dependent_std=False,
+                const_std=config['const_std'],
+                gc_encoder=encoders.get('actor'),
+            )
+
+        # step 5
+        network_info = dict(
+            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
+            # step 4b (same definition)
+            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
+            actor=(actor_def, (ex_observations, ex_goals)),
+        )
+        networks = {k: v[0] for k, v in network_info.items()}
+        network_args = {k: v[1] for k, v in network_info.items()}
+
+        network_def = ModuleDict(networks)
+        network_params = network_def.init(init_rng, **network_args)['params']
+
+        # step 6
+        network_tx = optax.adam(learning_rate=config['lr'])
+        network = TrainState.create(network_def, network_params, tx=network_tx)
+
+        # step 7
+        params = network_params
+        params['modules_target_critic'] = params['modules_critic']
+
+        return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
 def get_config():
@@ -405,11 +478,11 @@ def get_config():
             actor_loss_weight=1.0,
             const_std=True,
             discrete=False,
-            encoder=ml_collections.config_dict.placeholder(str),
+            encoder=None,
             policy_extraction='ddpgbc',
             use_oracle_distillation=False,
             # dataset stuff
-            dataset_class='GCDataset',
+            dataset_class='TRLDataset',
             value_p_curgoal=0.0,
             value_p_trajgoal=1.0,
             value_p_randomgoal=0.0,
@@ -420,7 +493,7 @@ def get_config():
             actor_geom_sample=False,
             gc_negative=False,
             p_aug=0.0,
-            frame_stack=ml_collections.config_dict.placeholder(int),
+            frame_stack=None,
         )
     )
     return config

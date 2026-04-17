@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import random
 import time
 from collections import defaultdict
@@ -11,7 +12,7 @@ import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import Dataset, GCDataset, HGCDataset
+from utils.datasets import Dataset, GCDataset, HGCDataset, TRLDataset
 from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
@@ -39,7 +40,9 @@ flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each tas
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
-config_flags.DEFINE_config_file('agent', 'impls/agents/gciql.py', lock_config=False)
+# goofiness to run main from any directory
+_default_agent_config = str(pathlib.Path(__file__).resolve().parent / 'agents' / 'trl.py')
+config_flags.DEFINE_config_file('agent', _default_agent_config, lock_config=False)
 
 
 def main(_):
@@ -60,6 +63,7 @@ def main(_):
     dataset_class = {
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
+        'TRLDataset': TRLDataset,
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:

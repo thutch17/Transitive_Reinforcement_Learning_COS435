@@ -398,3 +398,72 @@ class HGCDataset(GCDataset):
                 )
 
         return batch
+
+
+class TRLDataset:
+    def __init__(self, dataset, config):
+        """
+        pseudocode:
+        1. store observations and actions arrays
+        2. find trajectory boundaries from terminals
+           - ends = where terminals == 1
+           - starts = [0] + (ends[:-1] + 1)
+        3. store starts and lengths
+        """
+        self.dataset = dataset
+        self.observations = dataset['observations']
+        self.actions = dataset['actions']
+        self.terminals = dataset['terminals']
+        self.config = config
+        (self.ends,) = np.nonzero(self.terminals == 1)
+        self.starts = np.concatenate([[0], self.ends[:-1] + 1])
+        self.lengths = self.ends - self.starts + 1
+
+    def sample(self, batch_size):
+        """
+        sample (i, j, k) triples for the TRL value loss
+
+        pseudocode:
+        1. pick random trajectories
+        2. sample i, then j > i, then k in [i, j-1]
+        3. index into observations/actions arrays
+        4. return dict:
+           - s_i, a_i, s_j, a_j, s_k, a_k
+           - leg1_len (k - i), leg2_len (j - k)
+        
+        note: randomness uses np.random (seeded in main.py), same pattern as GCDataset.
+        """
+        # step 1 (trajectories of length 1 cannot satisfy i < j within the same traj)
+        valid_traj = np.nonzero(self.lengths >= 2)[0]
+        traj_idxs = valid_traj[np.random.randint(0, len(valid_traj), size=batch_size)]
+        starts = self.starts[traj_idxs]
+        lengths = self.lengths[traj_idxs]
+
+        # step 2: i_offset in [0, L-2] so j can lie in [i+1, L-1] relative to start
+        max_i_offset = np.maximum(lengths - 2, 0)
+        i_offsets = (np.random.rand(batch_size) * (max_i_offset + 1)).astype(int)
+        i_idxs = starts + i_offsets
+
+        # step 2
+        num_j = lengths - i_offsets - 1
+        j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
+        j_idxs = starts + j_offsets
+
+        # step 2
+        k_span = j_offsets - i_offsets
+        k_offsets = i_offsets + (np.random.rand(batch_size) * k_span).astype(int)
+        k_idxs = starts + k_offsets
+
+        # steps 3/4
+        return {
+            'observations': self.observations[i_idxs],
+            'actions': self.actions[i_idxs],
+            's_i': self.observations[i_idxs],
+            'a_i': self.actions[i_idxs],
+            's_j': self.observations[j_idxs],
+            'a_j': self.actions[j_idxs],
+            's_k': self.observations[k_idxs],
+            'a_k': self.actions[k_idxs],
+            'leg1_len': k_idxs - i_idxs,
+            'leg2_len': j_idxs - k_idxs,
+        }
