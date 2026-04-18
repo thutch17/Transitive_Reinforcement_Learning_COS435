@@ -40,9 +40,12 @@ flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each tas
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
-# goofiness to run main from any directory
+# Strategy 1 for running main.py
 _default_agent_config = str(pathlib.Path(__file__).resolve().parent / 'agents' / 'trl.py')
 config_flags.DEFINE_config_file('agent', _default_agent_config, lock_config=False)
+
+# Strategy 2 for running main.py
+# config_flags.DEFINE_config_file('agent', 'impls/agents/trl.py', lock_config=False)
 
 
 def main(_):

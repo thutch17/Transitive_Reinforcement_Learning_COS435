@@ -12,10 +12,7 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
 
 class TRLAgent(flax.struct.PyTreeNode):
-    """
-    this is all pseudocode for now will get it fr this weekend but didn't want
-    to be annoying and just start cranking code before anyone understands what's going
-    on
+    """Divide and conquer value learning for GCRL
 
     main sources to best understand high-level
     - section 4.2 explains how our in-trajectory subgoals are used
@@ -25,162 +22,166 @@ class TRLAgent(flax.struct.PyTreeNode):
     - algorithm 1 gives the high-level training loop
     """
 
-    # matching other agents
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
-    def expectile_loss(self, pred, target, base_loss):
-        """
-        where this exists in the paper:
-        - section 4.2 replaces the strict max over all subgoals with soft expectile regression
-        - equation (10) is the conceptual expectile version of the transitive update
-        - equation (11) uses the expectile variant d_kappa for the final TRL loss
+    def expectile_loss(self, x, y):
+        """Compute the expectile variant of binary cross-entropy loss.
+        
+        Section 3.1 defines the (conceptual) value loss used in Equation (10) as
+        the expectation of the expectile loss:
+            \ell_{\kappa}^{2}(x) = |\kappa - 1_{x < 0}| * x^2
+        **This is equivalent to what was defined in expectile_loss() in gciql.py**
 
-        pseudocode:
-        1. compare the current prediction to the target
-        2. if pred is above target, use weight (1 - kappa)
-        3. otherwise use weight kappa
-        4. multiply the pointwise base loss by that weight
-        5. return the weighted loss
+        In practice, Section 4.3.1 indicates that we optimize for the expectile
+        variant used in Equation (11):
+            D_{\kappa}(x, y) = |\kappa - 1_{x > y}| * D(x, y)
         """
-        # kind of a one liner so can pull into other if necessary just thought good to have func for each loss type
-        weight = jnp.where(pred > target, 1.0 - self.config['expectile'], self.config['expectile'])
-        return weight * base_loss
+        critic_logits, target_logits = x, y
+        target_labels = jax.nn.sigmoid(target_logits)
+        
+        # 1. Compute the binary cross-entropy loss
+        loss = optax.sigmoid_binary_cross_entropy(critic_logits, target_labels)
+        weight = jnp.where(
+            # 2. Evaluate indicator function
+            critic_logits <= target_logits,
+            # 3. If x <= y: weight = \kappa
+            self.config['expectile'],
+            # 4. If x > y:  weight = |\kappa - 1| for 0 < \kappa < 1
+            1 - self.config['expectile']
+        )
+
+        # 5. Return the weighted loss
+        return weight * loss
 
     def transitive_target(self, batch):
-        """build the TRL target from two trajectory segments.
+        """Compute the TRL target value:
+            \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j),
+        from two trajectory segments.
 
-        paper reference:
-        - equation (9) is the Q-based Bellman update we want here
-        - section 4.3.1 turns this into the TRL value loss in equation (11)
-        - the target is q_bar(s_i, a_i, s_k) * q_bar(s_k, a_k, s_j) (or edge cases)
-
-        pseudocode:
-        1. get subgoal batch from sample_behavioral_subgoals
-        2. for the first leg:
-           - if k-i <= 1, use gamma^(k-i)
-           - else evaluate the target critic on (s_i, a_i, s_k)
-        3. for the second leg:
-           - if j-k <= 1, use gamma^(j-k)
-           - else evaluate the target critic on (s_k, a_k, s_j)
-        4. multiply the two leg values together
-        5. return the target
+        Equation (9) establishes the Q-based Bellman update. Section 4.3.1 uses
+        this update rule in the TRL value loss computation in Equation (11).
         """
-        # step 1
+        # 1. Get subgoal batch
         subgoal_batch = batch
 
-        # see other agents, take more conservative estimate
         def reduce_critic_output(values):
+            # Identify critic in ensemble with most conservative target estimate
             if values.ndim > subgoal_batch['leg1_len'].ndim:
                 return jnp.min(values, axis=0)
             return values
 
-        # step 2
         discount = self.config['discount']
-        first_leg_bootstrap = self.network.select('target_critic')(
+
+        # 2. Compute the target of the first trajectory chunk
+        #    If k - i <= 1: \bar{Q}(s_i, a_i, s_k) = \gamma^{k - i}
+        first_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
         )
-        first_leg_bootstrap = reduce_critic_output(first_leg_bootstrap)
-        # edge condition k - i <= 1
-        first_leg = jnp.where(
+        first_leg_logits = reduce_critic_output(first_leg_logits)
+        first_leg_logits = jnp.where(
             subgoal_batch['leg1_len'] <= 1,
             discount ** subgoal_batch['leg1_len'],
-            first_leg_bootstrap,
+            first_leg_logits,
         )
 
-        # step 3
-        second_leg_bootstrap = self.network.select('target_critic')(
+        # 3. Compute the target of the first trajectory chunk
+        #    If j - k <= 1: \bar{Q}(s_k, a_k, s_j) = \gamma^{j - k}
+        second_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
         )
-        second_leg_bootstrap = reduce_critic_output(second_leg_bootstrap)
-        # edge condition j-k <= 1
-        second_leg = jnp.where(
+        second_leg_logits = reduce_critic_output(second_leg_logits)
+        second_leg_logits = jnp.where(
             subgoal_batch['leg2_len'] <= 1,
             discount ** subgoal_batch['leg2_len'],
-            second_leg_bootstrap,
+            second_leg_logits,
         )
 
-        # step 4/5
-        return first_leg * second_leg
+        # 4. Return the product of the target logits of the two trajectory chunks
+        return first_leg_logits * second_leg_logits
 
-    def distance_weight(self, critic_prediction):
-        """reweight samples so short chunks matter more b/c get bad cumluating bias if don't
+    def distance_weight(self, critic_logits):
+        """Reweight samples so short chunks matter more b/c get bad cumluating bias if don't
 
-        paper reference:
-        - section 4.3.1 introduces distance-based re-weighting
-        - longer chunks depend on shorter chunks being accurate first
-        - equation (11) uses the weight w(s_i, s_j)
-        - the weight is roughly inverse in estimated distance, controlled by lambda
+        The accuracy of the target value for a longer trajectory chunk (s_i to
+        s_j) depends on the accuracy of the target values for the two shorter
+        trajectory chunks (s_i to s_k and s_k to s_j). Section 4.3.1 proposes
+        distance-based re-weighting, in which the loss for each sample (s_i, s_j)
+        is weighted by the factor:
+            w(s_i, s_j) = (1 + \log_{\gamma} Q(s_i, a_i, s_j))^{-\lambda}
+        
+        The resulting weight for each trajectory chunk is (roughly) inversely
+        proportional to its estimated distance, yielding a higher weight to
+        shorter trajectory chunks.
 
         pseudocode:
         1. convert the critic prediction into an estimated distance
-        2. compute w = 1 / (1 + estimated_distance)^lambda
-        3. if lambda == 0, just return 1 for every sample
-        4. return the weights
         """
-        # step 3
         lam = self.config['distance_weight_lambda']
+        
+        # 1. If \lambda = 0: return 1 for every sample
         if lam == 0.0:
-            return jnp.ones_like(critic_prediction)
-        # step 1 (ok so little funky but from looking it seems you want to log transform in most cases?)
-        # like supposedly we want super long horizon to shrink weight exponentially but can change this
-        estimated_distance = -jnp.log(jnp.clip(critic_prediction, a_min=1e-8, a_max=1.0))
-        # step 2
-        w = 1.0 / (1.0 + estimated_distance) ** lam
-        return w
+            return jnp.ones_like(critic_logits)
+        
+        # FLAGGED: Echoing earlier concerns, this is my shot at it, but I'm not
+        #          sure if it's right/changed anything. Also not sure why clipping,
+        #          and what interval to clip to-- removed for now, but
+        #          original code commented below for reference.
+        # estimated_distance = -jnp.log(jnp.clip(critic_logits, a_min=1e-8, a_max=1.0))
+        # 2. Compute \log_{\gamma} Q(s_i, a_i, s_j)
+        estimated_distance = jnp.log(critic_logits) / jnp.log(self.config['gamma'])
+        
+        # 3. Compute distance-based re-weights
+        weights = 1.0 / ((1.0 + estimated_distance) ** lam)
+
+        # 4. Return distance-based re-weights
+        return weights
 
     def critic_loss(self, batch, grad_params):
-        """main TRL critic objective.
+        """Compute the TRL critic/value loss.
 
-        paper reference:
-        - called value loss in paper, just mathcing the other agents
-        - section 4.3.1 gives the reasoning
-        - equation (11) defines the TRL value loss
-        - they use binary cross-entropy as the base loss in experiments
-        - section 4.2 explains why expetcile regression is used instead of a hard max
-
-        pseudocode:
-        1. evaluate the online critic on q(s_i, a_i, s_j)
-        2. build the transitive target with transitive_target()
-        3. compute pointwise BCE between the critic prediction and the target
-        4. wrap that with expectile weighting
-        5. compute the distance-based sample weights with distance_weight
-        6. multiply the loss by those weights
-        7. average across the batch and return
-
+        Section 4.3.1 defines the value loss as (Equation 11):
+            L^{TRL}(Q) = E_{\tau \sim D}[
+                w(s_i, s_j) * D_{\kappa}(
+                    Q(s_i, a_i, s_j), \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
+                )
+            ]
+        where D is the expectile variant of the binary cross-entropy loss.
         """
-        # step 1
-        # probably debug this later not sure if we should be outputting logits but i think so with BCE?
-        critic_logits = self.network.select('critic')(batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params)
+        # FLAGGED: overall function -- when to use logits vs. labels??? Currently
+        #          made the assumption that labels are only used for the BCE loss;
+        #          otherwise always treat the network as if it outputs logits.
+
+        # 1. Evaluate the online critic on Q(s_i, a_i, s_j)
+        critic_logits = self.network.select('critic')(
+            batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
+        )
         if critic_logits.ndim > batch['leg1_len'].ndim:
             critic_logits = jnp.min(critic_logits, axis=0)
-        critic_prediction = jax.nn.sigmoid(critic_logits)
+        # critic_labels = jax.nn.sigmoid(critic_logits)
 
-        # step 2
-        target = self.transitive_target(batch)
+        # 2. Evaluate the target critic on \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
+        target_logits = self.transitive_target(batch)
+        # target_labels = jax.nn.sigmoid(target_logits)
 
-        # step 3
-        base_loss = optax.sigmoid_binary_cross_entropy(critic_logits, target)
+        # 3. Compute the expectile variant of the binary cross-entropy loss between
+        #    the online critic prediction and target critic
+        expectile_loss = self.expectile_loss(critic_logits, target_logits)
 
-        # step 4
-        expectile_loss = self.expectile_loss(critic_prediction, target, base_loss)
-
-        # step 5
-        sample_weights = self.distance_weight(critic_prediction)
-
-        # steps 6/7
-        critic_loss = (expectile_loss * sample_weights).mean()
+        # 4. Compute distance-based re-weighted loss
+        weights = self.distance_weight(critic_logits)
+        critic_loss = (expectile_loss * weights).mean()
 
         return critic_loss, {
             'critic_loss': critic_loss,
-            'pred_mean': critic_prediction.mean(),
-            'pred_max': critic_prediction.max(),
-            'pred_min': critic_prediction.min(),
-            'target_mean': target.mean(),
-            'target_max': target.max(),
-            'target_min': target.min(),
-            'weight_mean': sample_weights.mean(),
+            'pred_mean': critic_logits.mean(),
+            'pred_max': critic_logits.max(),
+            'pred_min': critic_logits.min(),
+            'target_mean': target_logits.mean(),
+            'target_max': target_logits.max(),
+            'target_min': target_logits.min(),
+            'weight_mean': weights.mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
@@ -231,21 +232,18 @@ class TRLAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
-        """combine every loss term that should be optimized together.
+        """Compute the total loss.
 
         paper reference:
         - algorithm 1 separates value learning and policy extraction, but also
           these can be run in parallel (yay jax)
         - ogbench agents expose one 'total_loss' entry point for optimization
-
-        pseudocode:
-        1. get actor and critic losses from functions
-        2. do appropriate dimensioning and summing and return
+        **Code should be the same from all other agent implementations (like gciql.py)!**
         """
         info = {}
         rng = rng if rng is not None else self.rng
 
-        #step 1
+        # 1. Compute actor and critic losses.
         critic_loss, critic_info = self.critic_loss(batch, grad_params)
         for k, v in critic_info.items():
             # the slash is arbitrary but use when indexing (ie critic/loss)
@@ -256,8 +254,11 @@ class TRLAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        # step 2
-        loss = self.config['critic_loss_weight'] * critic_loss + self.config['actor_loss_weight'] * actor_loss
+        # 2. Compute total loss.
+        loss = (
+            self.config['critic_loss_weight'] * critic_loss + 
+            self.config['actor_loss_weight'] * actor_loss
+        )
         return loss, info
 
     def target_update(self, network, module_name):
@@ -268,56 +269,45 @@ class TRLAgent(flax.struct.PyTreeNode):
         - so the code needs a target critic and a way to keep it synced but not overcorect
         - ogbench agents do this with "polyak" averaging (thanks Google)
         - this is not like a paper thing really just open ended target network
-
-        pseudocode:
-        1. read the online parameters
-        2. read the target parameters
-        3. blend them with tau
-        4. write the new target params
+        **Code be should the same from all other agent implementations (like gciql.py)!**
         """
-
-        def polyak_average(p, tp):
-            return p * self.config['tau'] + tp * (1 - self.config['tau'])
-
-        # ok i'm probably messing up this jax/parameters thing since had to be googling
         new_target_params = jax.tree_util.tree_map(
-            # step 3
-            polyak_average,
-            # step 1 (the current critic weights)
+            # 3. Compute Polyak average of model parameters
+            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            # 1. Read current critic parameters.
             self.network.params[f'modules_{module_name}'],
-            # step 2 (lagged copy for stability)
+            # 2. Read target critic parameters (lagged copy for stability).
             self.network.params[f'modules_target_{module_name}'],
         )
-        # step 4
+
+        # 4. Write new target parameters.
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
     def update(self, batch):
-        """one training step.
+        """Update the agent for one training step and return a new agent with
+        information dictionary.
 
+        Args:
+            batch: dict of sample (i, j, k) triples
+        
         paper reference:
         - algorithm 1 is an iterative training loop over dataset trajectory chunks
         - in ogbench, each agent exposes an 'update' function that does exactly one step
-
-        pseudocode:
-        1. split rng
-        2. run one optimizer step on the network params
-        3. update the target critic
-        4. return the new agent & log stuff
         """
-        # step 1
+        # 1. Initialize RNG subkey
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
             return self.total_loss(batch, grad_params, rng=rng)
 
-        # step 2
+        # 2. Run one optimizer step on network params
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
-        # step 3
+        # 3. Update target critic
         self.target_update(new_network, 'critic')
 
-        # step 4
+        # 4. Return new agent and information dictionary
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
@@ -328,24 +318,36 @@ class TRLAgent(flax.struct.PyTreeNode):
         seed=None,
         temperature=1.0,
     ):
-        """action selection for rollouts / evaluation.
+        """Sample actions from actor network for rollouts / evaluation.
 
-        paper reference:
-        - after policy extraction, the learned policy has to be queried when testing/evaluating
-        - rolling with direct actor as opposed to rejection-sampling (see 4.3.2, equations 4/5)
-
-        pseudocode:
-        1. evaluate pi(a | s, g)
-        2. sample or take the mode
-        3. clip continuous actions if needed
+        Section 3.1 and 4.3.2 extracts a policy that maximizes the learned value
+        either by:
+         - Equation (4): Reparametrized Gradients - maximizing the DDPG+BC objective
+         - Equation (5): Rejection Sampling - maximizing the value function
+        By default, policy extraction is completed by reparametrized gradients.
         """
-        # step 1
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
-        # step 2
-        actions = dist.sample(seed=seed)
-        # step 3
-        if not self.config['discrete']:
-            actions = jnp.clip(actions, -1, 1)
+        # Extract policy according to reparametrized gradients
+        if self.config['policy_extraction'] == 'ddpgbc':
+            # 1. Compute \pi(a | s, g) \forall a \in A, where \pi is previously
+            #    updated to maximize the DDPG+BC objective
+            dist = self.network.select('actor')(observations, goals, temperature=temperature)
+            # 2. Sample action
+            actions = dist.sample(seed=seed)
+            # 3. Clip continuous actions
+            if not self.config['discrete']:
+                actions = jnp.clip(actions, -1, 1)
+        # Extract policy according to rejection sampling
+        else:
+            # FLAGGED: Actions seem to be sampled from a BC policy-- is this
+            #          separate from the actual policy that we're training???
+            #          THIS IS DEFINITELY WRONG!!!
+            # 1. Sample behavioral action samples from a goal-conditioned BC policy
+            dist = self.network.select('actor')(observations, goals, temperature=temperature)
+            q_actions = dist.sample(seed=seed)
+            # 2. Compute Q(s, a, g) \forall a \in A
+            q = self.network.select('critic')(observations, goals, q_actions)
+            # 3. Determine a* that maximizes 
+            actions = q_actions[jnp.argmax(q)]
         return actions
 
     @classmethod
@@ -356,144 +358,135 @@ class TRLAgent(flax.struct.PyTreeNode):
         ex_actions,
         config,
     ):
-        """construct the TRL agent and its modules.
+        """Create a new agent.
+
+        Args:
+            seed: random seed.
+            ex_observations: Example batch of observations.
+            ex_actions: Example batch of actions. In discrete-action MDPs, this should contain the maximum action value.
+            config: Configuration dictionary.
 
         paper reference:
         - another key function for the ogbench agents
         - section 4.3 says TRL learns a goal-conditioned Q and then extracts a policy
         - equation (11) needs an online critic and a target critic
         - section 4.3.2 needs a policy module for extraction
-
-        pseudocode:
-        1. initialize the rng
-        2. get the action and other dimensions dimension
-        3. build optional encoders if the environment is visual
-        4. build:
-           - critic: Q(s, a, g)
-           - target_critic: slowly updated copy of Q
-           - actor: pi(a | s, g)
-        5. initialize params from example inputs
-        6. create the optimizer state
-        7. return the agent
         """
-        # step 1
+        # 1. Initialize the RNG key
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        # step 2
+        # 2. Define action dimension from example observations
         ex_goals = ex_observations
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
             action_dim = ex_actions.shape[-1]
 
-        # step 3
-        encoders = dict()
-        if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+        # FLAGGED: TRL datasets are state-based, not pixel-based. Revisit if 
+        #    we expand our set of environments to "visual-<ENV>"
+        # encoders = dict()
+        # if config['encoder'] is not None:
+        #     encoder_module = encoder_modules[config['encoder']]
+        #     encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
+        #     encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
 
-        # step 4a (not positive if all required args here?)
-        if config['discrete']:
-            critic_def = GCDiscreteCritic(
-                hidden_dims=config['value_hidden_dims'],
-                layer_norm=config['layer_norm'],
-                ensemble=True,
-                gc_encoder=encoders.get('critic'),
-                action_dim=action_dim,
-            )
-        else:
-            critic_def = GCValue(
-                hidden_dims=config['value_hidden_dims'],
-                layer_norm=config['layer_norm'],
-                ensemble=True,
-                gc_encoder=encoders.get('critic'),
-            )
-
-        # step 4c
+        # 3. Define actor-critic network
         if config['discrete']:
             actor_def = GCDiscreteActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
-                gc_encoder=encoders.get('actor'),
+                # final_fc_init_scale: float = 1e-2
+                # gc_encoder=encoders.get('actor'),
+            )
+            critic_def = GCDiscreteCritic(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,  # FLAGGED: Does TRL use ensemble value functions?
+                # gc_encoder=encoders.get('critic'),
+                action_dim=action_dim,
             )
         else:
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
+                # log_std_min=-5,
+                # log_std_max=2,
+                # tanh_squash: False,
                 state_dependent_std=False,
                 const_std=config['const_std'],
-                gc_encoder=encoders.get('actor'),
+                # final_fc_init_scale: float = 1e-2
+                # gc_encoder=encoders.get('actor'),
+            )
+            critic_def = GCValue(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,  # FLAGGED: Does TRL use ensemble value functions?
+                # gc_encoder=encoders.get('critic'),
             )
 
-        # step 5
+        # 4. Initialize network parameters
         network_info = dict(
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            # step 4b (same definition)
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
             actor=(actor_def, (ex_observations, ex_goals)),
+            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
         network_params = network_def.init(init_rng, **network_args)['params']
-
-        # step 6
-        network_tx = optax.adam(learning_rate=config['lr'])
-        network = TrainState.create(network_def, network_params, tx=network_tx)
-
-        # step 7
+        
+        # 5. Initialize critic and target critic with same parameters
         params = network_params
         params['modules_target_critic'] = params['modules_critic']
 
+        # 6. Initialize optimizers
+        network_tx = optax.adam(learning_rate=config['lr'])
+        network = TrainState.create(network_def, network_params, tx=network_tx)
+
+        # 7. Return the agent
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
 def get_config():
-    """starter config for a trl implementation.
-
-    extra fields:
-    - `expectile` is needed because section 4.2 / equation (11) use expectile regression
-    - `distance_weight_lambda` is needed because section 4.3.1 introduces re-weighting
+    """
     - `alpha` is needed for reparameterized policy extraction from equation (4)
-    - `dataset_class` is left as `GCDataset` for now (need to figure this out)
     """
     config = ml_collections.ConfigDict(
         dict(
-            # agent stuff
-            agent_name='trl',
-            lr=3e-4,
-            batch_size=1024,
-            actor_hidden_dims=(512, 512, 512),
-            value_hidden_dims=(512, 512, 512),
-            layer_norm=True,
-            discount=0.99,
-            tau=0.005,
-            alpha=0.1,
-            expectile=0.7,
-            distance_weight_lambda=0.0,
-            critic_loss_weight=1.0,
-            actor_loss_weight=1.0,
-            const_std=True,
-            discrete=False,
-            encoder=None,
-            policy_extraction='ddpgbc',
+            # Agent hyperparameters
+            agent_name='trl',  # Agent name.
+            lr=3e-4,  # Learning rate.
+            batch_size=1024,  # Batch size.
+            actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
+            value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
+            layer_norm=True,  # Whether to use layer normalization.
+            discount=0.999,  # Discount factor.
+            tau=0.005,  # Model parameter update rate for Polyak average.
+            alpha=0.1,  # BC coefficient in DDPG+BC
+            expectile=0.7,  # Parameter for expectile regression loss.
+            distance_weight_lambda=0.0,  # Distance-based re-weighting parameter.
+            critic_loss_weight=1.0,  # Coefficient for critic loss in total loss.
+            actor_loss_weight=1.0,  # Coefficient for actor loss in total loss.
+            const_std=True,  # Whether to use constant standard deviation for the actor.
+            discrete=False,  # Whether the action space is discrete.
+            encoder=None,  # Unused, all environments are state-based, not pixel-based.
+            policy_extraction='ddpgbc',  # Method ('ddpgbc' or 'rejection') for policy extraction.
             use_oracle_distillation=False,
-            # dataset stuff
-            dataset_class='TRLDataset',
-            value_p_curgoal=0.0,
-            value_p_trajgoal=1.0,
-            value_p_randomgoal=0.0,
-            value_geom_sample=True,
-            actor_p_curgoal=0.0,
-            actor_p_trajgoal=1.0,
-            actor_p_randomgoal=0.0,
-            actor_geom_sample=False,
-            gc_negative=False,
-            p_aug=0.0,
-            frame_stack=None,
+            # Dataset hyperparameters.
+            dataset_class='TRLDataset',  # Dataset class name.
+            value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
+            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
+            value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
+            value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
+            actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
+            actor_p_trajgoal=0.0,  # Probability of using a future state in the same trajectory as the actor goal.
+            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
+            actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
+            gc_negative=False,  # Unused (defined for compatibility with GCDataset).
+            p_aug=0.0,  # Probability of applying image augmentation.
+            frame_stack=None,  # Number of frames to stack.
         )
     )
     return config

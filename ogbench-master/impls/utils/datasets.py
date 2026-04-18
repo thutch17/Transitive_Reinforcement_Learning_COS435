@@ -456,8 +456,10 @@ class TRLDataset:
 
         # steps 3/4
         return {
+            # Maintained 'observations' and 'actions' for compatibility
             'observations': self.observations[i_idxs],
             'actions': self.actions[i_idxs],
+            # (i, j, k) triples
             's_i': self.observations[i_idxs],
             'a_i': self.actions[i_idxs],
             's_j': self.observations[j_idxs],
