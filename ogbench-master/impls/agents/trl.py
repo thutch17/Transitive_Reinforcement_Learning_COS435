@@ -26,7 +26,7 @@ class TRLAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def expectile_loss(self, x, y):
+    def expectile_loss(self, critic_logits, target_labels):
         """Compute the expectile variant of binary cross-entropy loss.
         
         Section 3.1 defines the (conceptual) value loss used in Equation (10) as
@@ -38,14 +38,13 @@ class TRLAgent(flax.struct.PyTreeNode):
         variant used in Equation (11):
             D_{\kappa}(x, y) = |\kappa - 1_{x > y}| * D(x, y)
         """
-        critic_logits, target_logits = x, y
-        target_labels = jax.nn.sigmoid(target_logits)
+        critic_labels = jax.nn.sigmoid(critic_logits)
         
         # 1. Compute the binary cross-entropy loss
         loss = optax.sigmoid_binary_cross_entropy(critic_logits, target_labels)
         weight = jnp.where(
             # 2. Evaluate indicator function
-            critic_logits <= target_logits,
+            critic_labels <= target_labels, # indicator function should compare probability labels
             # 3. If x <= y: weight = \kappa
             self.config['expectile'],
             # 4. If x > y:  weight = |\kappa - 1| for 0 < \kappa < 1
@@ -66,7 +65,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 1. Get subgoal batch
         subgoal_batch = batch
 
-        def reduce_critic_output(values):
+        def reduce_critic_output(values): # today I learned you can define a function inside a function in python, who knew
             # Identify critic in ensemble with most conservative target estimate
             if values.ndim > subgoal_batch['leg1_len'].ndim:
                 return jnp.min(values, axis=0)
@@ -80,10 +79,13 @@ class TRLAgent(flax.struct.PyTreeNode):
             subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
         )
         first_leg_logits = reduce_critic_output(first_leg_logits)
-        first_leg_logits = jnp.where(
+
+        first_leg_labels = jax.nn.sigmoid(first_leg_logits)
+
+        first_leg_labels = jnp.where(
             subgoal_batch['leg1_len'] <= 1,
             discount ** subgoal_batch['leg1_len'],
-            first_leg_logits,
+            first_leg_labels,
         )
 
         # 3. Compute the target of the first trajectory chunk
@@ -91,15 +93,19 @@ class TRLAgent(flax.struct.PyTreeNode):
         second_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
         )
+
         second_leg_logits = reduce_critic_output(second_leg_logits)
-        second_leg_logits = jnp.where(
+
+        second_leg_labels = jax.nn.sigmoid(second_leg_logits)
+
+        second_leg_labels = jnp.where(
             subgoal_batch['leg2_len'] <= 1,
             discount ** subgoal_batch['leg2_len'],
-            second_leg_logits,
+            second_leg_labels,
         )
 
         # 4. Return the product of the target logits of the two trajectory chunks
-        return first_leg_logits * second_leg_logits
+        return first_leg_labels * second_leg_labels
 
     def distance_weight(self, critic_logits):
         """Reweight samples so short chunks matter more b/c get bad cumluating bias if don't
@@ -119,18 +125,18 @@ class TRLAgent(flax.struct.PyTreeNode):
         1. convert the critic prediction into an estimated distance
         """
         lam = self.config['distance_weight_lambda']
+        critic_labels = jax.nn.sigmoid(critic_logits)
         
         # 1. If \lambda = 0: return 1 for every sample
         if lam == 0.0:
-            return jnp.ones_like(critic_logits)
+            return jnp.ones_like(critic_labels)
         
-        # FLAGGED: Echoing earlier concerns, this is my shot at it, but I'm not
-        #          sure if it's right/changed anything. Also not sure why clipping,
-        #          and what interval to clip to-- removed for now, but
-        #          original code commented below for reference.
-        # estimated_distance = -jnp.log(jnp.clip(critic_logits, a_min=1e-8, a_max=1.0))
+        # 1.5. The clipping isn't stricly neccesary but would help with numerical stability
+        critic_labels_clipped = jnp.clip(critic_labels, a_min=1e-8, a_max=1.0 - 1e-8)
+
+
         # 2. Compute \log_{\gamma} Q(s_i, a_i, s_j)
-        estimated_distance = jnp.log(critic_logits) / jnp.log(self.config['gamma'])
+        estimated_distance = jnp.log(critic_labels_clipped) / jnp.log(self.config['discount']) #this looks fine to me...
         
         # 3. Compute distance-based re-weights
         weights = 1.0 / ((1.0 + estimated_distance) ** lam)
@@ -149,28 +155,30 @@ class TRLAgent(flax.struct.PyTreeNode):
             ]
         where D is the expectile variant of the binary cross-entropy loss.
         """
-        # FLAGGED: overall function -- when to use logits vs. labels??? Currently
-        #          made the assumption that labels are only used for the BCE loss;
-        #          otherwise always treat the network as if it outputs logits.
-
+        # NOTE (regarding logits vs. labels):     
+        # After doing some searching, you need to feed in logits to the expectile loss
+        # for the sigmoid binary cross-entropy loss to be well-behaved
+        # but for the distance based reweighing you need to convert to labels
+        # so that inputs are in (0, 1) and the loss is well-behaved. 
+        # In general, if something looks like it should be a probability or bounded between 0 and 1, it probably is a label
+        # For consistancy's sake I labeled what goes into the expectile loss as "logits" and what goes into the distance weight as "labels"
+        
         # 1. Evaluate the online critic on Q(s_i, a_i, s_j)
         critic_logits = self.network.select('critic')(
             batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
         )
         if critic_logits.ndim > batch['leg1_len'].ndim:
             critic_logits = jnp.min(critic_logits, axis=0)
-        # critic_labels = jax.nn.sigmoid(critic_logits)
 
         # 2. Evaluate the target critic on \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
-        target_logits = self.transitive_target(batch)
-        # target_labels = jax.nn.sigmoid(target_logits)
+        target_labels = self.transitive_target(batch)
 
         # 3. Compute the expectile variant of the binary cross-entropy loss between
         #    the online critic prediction and target critic
-        expectile_loss = self.expectile_loss(critic_logits, target_logits)
+        expectile_loss = self.expectile_loss(critic_logits=critic_logits, target_labels=target_labels)
 
         # 4. Compute distance-based re-weighted loss
-        weights = self.distance_weight(critic_logits)
+        weights = self.distance_weight(critic_logits=critic_logits)
         critic_loss = (expectile_loss * weights).mean()
 
         return critic_loss, {
@@ -178,9 +186,9 @@ class TRLAgent(flax.struct.PyTreeNode):
             'pred_mean': critic_logits.mean(),
             'pred_max': critic_logits.max(),
             'pred_min': critic_logits.min(),
-            'target_mean': target_logits.mean(),
-            'target_max': target_logits.max(),
-            'target_min': target_logits.min(),
+            'target_mean': target_labels.mean(),
+            'target_max': target_labels.max(),
+            'target_min': target_labels.min(),
             'weight_mean': weights.mean(),
         }
 
@@ -192,43 +200,49 @@ class TRLAgent(flax.struct.PyTreeNode):
         - section 4.3.2 says TRL first learns the value, then extracts a policy
         - paper uses reparameterized gradients in equation 4 (not super clear)
 
-        pseudocode for the default path:
+        pseudocode for the default path (reparameterized gradients aka ddpg+bc):
         1. sample or reparameterize an action a_pi ~ pi(. | s, g)
         2. evaluate Q(s, a_pi, g) with the learned critic
         3. compute the DDPG+BC style objective (equation 4):
            q(s, a_pi, g) + alpha * log pi(a | s, g)
         4. maximize that objective, or equivalently minimize its negative
         5. return the actor loss and logging stats
+
+        This should branch for the rejection sampling policy extraction method, but that is not currently implemented.
         """
-        # step 1
-        dist = self.network.select('actor')(
-            batch['s_i'], batch['s_j'], params=grad_params
-        )
-        rng = rng if rng is not None else self.rng
-        actions = dist.sample(seed=rng)
+        if self.config['policy_extraction'] == 'ddpgbc':
+            # step 1
+            dist = self.network.select('actor')(
+                batch['s_i'], batch['s_j'], params=grad_params
+            )
+            rng = rng if rng is not None else self.rng
+            actions = dist.sample(seed=rng)
 
-        # step 2
-        q_vals = self.network.select('critic')(
-            batch['s_i'], batch['s_j'], actions, params=grad_params
-        )
-        # again take min? this can change but want conservative updates
-        if q_vals.ndim > batch['leg1_len'].ndim:
-            q_vals = jnp.min(q_vals, axis=0)
+            # step 2
+            q_vals = self.network.select('critic')(
+                batch['s_i'], batch['s_j'], actions, params=grad_params
+            )
+            # again take min? this can change but want conservative updates
+            if q_vals.ndim > batch['leg1_len'].ndim:
+                q_vals = jnp.min(q_vals, axis=0)
 
-        # step 3/4: log prob
-        log_prob = dist.log_prob(actions)
-        alpha = self.config['alpha']
-        objective = q_vals + alpha * log_prob
+            # step 3/4: log prob
+            log_prob = dist.log_prob(actions)
+            alpha = self.config['alpha']
+            objective = q_vals + alpha * log_prob
 
-        # step 5
-        actor_loss = -objective.mean()
-        return actor_loss, {
-            'actor_loss': actor_loss,
-            'q_mean': q_vals.mean(),
-            'q_max': q_vals.max(),
-            'q_min': q_vals.min(),
-            'log_prob_mean': log_prob.mean(),
-        }
+            # step 5
+            actor_loss = -objective.mean()
+            return actor_loss, {
+                'actor_loss': actor_loss,
+                'q_mean': q_vals.mean(),
+                'q_max': q_vals.max(),
+                'q_min': q_vals.min(),
+                'log_prob_mean': log_prob.mean(),
+            }
+        elif self.config['policy_extraction'] == 'rejection':
+            # FLAGGED: This is a placeholder for the rejection sampling policy extraction method, which is not currently implemented.
+            raise NotImplementedError("Rejection sampling policy extraction is not yet implemented.")
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -336,13 +350,21 @@ class TRLAgent(flax.struct.PyTreeNode):
             # 3. Clip continuous actions
             if not self.config['discrete']:
                 actions = jnp.clip(actions, -1, 1)
+
         # Extract policy according to rejection sampling
-        else:
+        elif self.config['policy_extraction'] == 'rejection':
             # FLAGGED: Actions seem to be sampled from a BC policy-- is this
             #          separate from the actual policy that we're training???
             #          THIS IS DEFINITELY WRONG!!!
+            # equation: \pi(a | s, g) argmax_{a_1, ... a_n, a_i ~ \pi^\beta (a | s, g)} Q(s, a_i, g)
+            # where \pi^\beta is a goal-condition BC policy separate from the actual policy
+            # the BC policy is modeled by an expressive generation model (diffusion mode) and flow matching
             # 1. Sample behavioral action samples from a goal-conditioned BC policy
             dist = self.network.select('actor')(observations, goals, temperature=temperature)
+            # how to generate the behavioral action samples?
+            ###
+            # FLAGGED: This is a placeholder for sampling from the BC policy, which is not currently implemented.
+            ###
             q_actions = dist.sample(seed=seed)
             # 2. Compute Q(s, a, g) \forall a \in A
             q = self.network.select('critic')(observations, goals, q_actions)
