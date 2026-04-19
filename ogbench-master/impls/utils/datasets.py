@@ -446,7 +446,13 @@ class TRLDataset:
 
         # step 2
         num_j = lengths - i_offsets - 1
-        j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
+        # geometric offset instead of uniform
+        if self.config['value_geom_sample']:
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
+            offsets = np.minimum(offsets, num_j)  # clip to trajectory bounds
+            j_offsets = i_offsets + offsets
+        else:
+            j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
         j_idxs = starts + j_offsets
 
         # step 2

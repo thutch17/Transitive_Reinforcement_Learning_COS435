@@ -88,7 +88,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             first_leg_labels,
         )
 
-        # 3. Compute the target of the first trajectory chunk
+        # 3. Compute the target of the second trajectory chunk
         #    If j - k <= 1: \bar{Q}(s_k, a_k, s_j) = \gamma^{j - k}
         second_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
@@ -133,7 +133,6 @@ class TRLAgent(flax.struct.PyTreeNode):
         
         # 1.5. The clipping isn't stricly neccesary but would help with numerical stability
         critic_labels_clipped = jnp.clip(critic_labels, a_min=1e-8, a_max=1.0 - 1e-8)
-
 
         # 2. Compute \log_{\gamma} Q(s_i, a_i, s_j)
         estimated_distance = jnp.log(critic_labels_clipped) / jnp.log(self.config['discount']) #this looks fine to me...
@@ -227,7 +226,7 @@ class TRLAgent(flax.struct.PyTreeNode):
                 q_vals = jnp.min(q_vals, axis=0)
 
             # step 3/4: log prob
-            log_prob = dist.log_prob(actions)
+            log_prob = dist.log_prob(batch['a_i']) # should be computing pi(a | s, g), not pi(a_pi | s, g)
             alpha = self.config['alpha']
             objective = q_vals + alpha * log_prob
 
@@ -359,6 +358,8 @@ class TRLAgent(flax.struct.PyTreeNode):
             # equation: \pi(a | s, g) argmax_{a_1, ... a_n, a_i ~ \pi^\beta (a | s, g)} Q(s, a_i, g)
             # where \pi^\beta is a goal-condition BC policy separate from the actual policy
             # the BC policy is modeled by an expressive generation model (diffusion mode) and flow matching
+            raise NotImplementedError("Rejection sampling is not yet implemented.")
+            
             # 1. Sample behavioral action samples from a goal-conditioned BC policy
             dist = self.network.select('actor')(observations, goals, temperature=temperature)
             # how to generate the behavioral action samples?
