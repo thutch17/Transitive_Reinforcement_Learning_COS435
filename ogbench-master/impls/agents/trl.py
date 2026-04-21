@@ -219,7 +219,7 @@ class TRLAgent(flax.struct.PyTreeNode):
 
             # step 2
             q_vals = self.network.select('critic')(
-                batch['s_i'], batch['s_j'], actions, params=grad_params
+                batch['s_i'], batch['s_j'], actions
             )
             # again take min? this can change but want conservative updates
             if q_vals.ndim > batch['leg1_len'].ndim:
