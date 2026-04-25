@@ -64,11 +64,6 @@ class TRLAgent(flax.struct.PyTreeNode):
         if self.config['use_oracle_distillation']:
             goal_key = 'oracle_s_j'
             midpoint_key = 'oracle_s_k'
-            if goal_key not in batch or midpoint_key not in batch:
-                raise KeyError(
-                    f'use_oracle_distillation=True but batch missing keys: {goal_key}, {midpoint_key}. '
-                    f'Batch keys: {list(batch.keys())}'
-                )
         else:
             goal_key = 's_j'
             midpoint_key = 's_k'
@@ -191,16 +186,16 @@ class TRLAgent(flax.struct.PyTreeNode):
         weights = self.distance_weight(critic_logits=critic_logits)
         critic_loss = (expectile_loss * weights).mean()
 
+        # is using oracle distillation, also compute distillation loss and add to critic loss
         if self.config['use_oracle_distillation']:
             oracle_logits = self.network.select('oracle_critic')(
                 batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
             )
-            if oracle_logits.ndim > batch['leg1_len'].ndim:
-                oracle_logits = jnp.min(oracle_logits, axis=0)
 
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
                 oracle_logits, jax.lax.stop_gradient(jax.nn.sigmoid(critic_logits))
             ).mean()
+
             critic_loss = critic_loss + oracle_distill_loss
 
         return critic_loss, {
@@ -263,8 +258,8 @@ class TRLAgent(flax.struct.PyTreeNode):
                 'log_prob_mean': log_prob.mean(),
             }
         
+        # gets the actor loss from rejection sampling with flow model
         elif self.config['policy_extraction'] == 'rejection':
-            assert not self.config['discrete']
             rng = rng if rng is not None else self.rng
             batch_size, action_dim = batch['a_i'].shape
             x_rng, t_rng = jax.random.split(rng, 2)
@@ -397,7 +392,6 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         # Extract policy according to rejection sampling
         elif self.config['policy_extraction'] == 'rejection':
-            assert not self.config['discrete']
             # equation: \pi(a | s, g) argmax_{a_1, ... a_n, a_i ~ \pi^\beta (a | s, g)} Q(s, a_i, g)
             # where \pi^\beta is a goal-condition BC policy separate from the actual policy
             # the BC policy is modeled by an expressive generation model (diffusion mode) and flow matching
@@ -406,11 +400,7 @@ class TRLAgent(flax.struct.PyTreeNode):
 
             n_obs = jnp.repeat(jnp.expand_dims(observations, 0), repeats=pe_info.num_samples, axis=0) # 
             n_goals = jnp.repeat(jnp.expand_dims(goals, 0), repeats=pe_info.num_samples, axis=0) 
-            if seed is None:
-                raise ValueError('sample_actions requires a PRNG seed for rejection policy extraction.')
-            n_actions = jax.random.normal(
-                seed,
-                (
+            n_actions = jax.random.normal(seed, (
                     pe_info.num_samples,
                     *observations.shape[:-1],
                     self.network.select('actor').action_dim,
@@ -505,7 +495,6 @@ class TRLAgent(flax.struct.PyTreeNode):
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
-                # gc_encoder=encoders.get('critic'),
                 action_dim=action_dim,
             )
 
@@ -533,13 +522,11 @@ class TRLAgent(flax.struct.PyTreeNode):
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
-                # gc_encoder=encoders.get('critic'),
             )
 
             ex_actor_input = (ex_observations, ex_goals)
 
         if config["policy_extraction"] == 'rejection':
-            assert not config['discrete']
             actor_def = ActorVectorField(
                 hidden_dims=config["actor_hidden_dims"],
                 action_dim=action_dim,
@@ -595,10 +582,10 @@ def get_config():
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=None,  # Unused, all environments are state-based, not pixel-based.
-            policy_extraction='ddpgbc',  # Method ('ddpgbc' or 'rejection') for policy extraction.
+            policy_extraction='rejection',  # Method ('ddpgbc' or 'rejection') for policy extraction.
             ddpgc=ml_collections.ConfigDict(dict(alpha =0.03, const_std=True)), # hyperparameters for the ddpg+bc policy extraction method, used when policy_extraction='ddpgbc'
             rejection=ml_collections.ConfigDict(dict(num_samples=32, flow_steps=10)), # hyperparameters for the rejection sampling policy extraction method, used when policy_extraction='rejection'
-            use_oracle_distillation=False,
+            use_oracle_distillation=False, # Whether oracle distillation is used
             # Dataset hyperparameters.
             dataset_class='TRLDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
