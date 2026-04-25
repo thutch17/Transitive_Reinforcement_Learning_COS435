@@ -515,3 +515,61 @@ class GCIQEValue(nn.Module):
             return v, phi_s, phi_g
         else:
             return v
+
+class ActorVectorField(nn.Module):
+    """Actor vector field for flow policies.
+
+    Attributes:
+        hidden_dims: Hidden layer dimensions.
+        action_dim: Action dimension.
+        mlp_class: MLP class.
+        activate_final: Whether to apply activation to the final layer.
+        layer_norm: Whether to apply layer normalization.
+        gc_encoder: Optional GCEncoder module to encode the inputs.
+    """
+
+    hidden_dims: Sequence[int]
+    action_dim: int
+    mlp_class: Any = MLP
+    activate_final: bool = False
+    layer_norm: bool = False
+    gc_encoder: nn.Module = None
+
+    def setup(self) -> None:
+        self.mlp = self.mlp_class(
+            (*self.hidden_dims, self.action_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )
+
+    @nn.compact
+    def __call__(
+        self, observations, goals=None, actions=None, times=None, is_encoded=False
+    ):
+        """Return the current vector.
+
+        Args:
+            observations: Observations.
+            goals: Goals (optional).
+            actions: Current actions.
+            times: Current times (optional).
+            is_encoded: Whether the inputs are already encoded.
+        """
+        if not is_encoded and self.gc_encoder is not None:
+            if goals is None:
+                inputs = self.gc_encoder(observations)
+            else:
+                inputs = self.gc_encoder(observations, goals)
+        else:
+            if goals is None:
+                inputs = observations
+            else:
+                inputs = jnp.concatenate([observations, goals], axis=-1)
+        if times is None:
+            inputs = jnp.concatenate([inputs, actions], axis=-1)
+        else:
+            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
+
+        v = self.mlp(inputs)
+
+        return v

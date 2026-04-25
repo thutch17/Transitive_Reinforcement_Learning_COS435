@@ -5,11 +5,10 @@ import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
-import numpy as np
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
+from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue, ActorVectorField
 
 class TRLAgent(flax.struct.PyTreeNode):
     """Divide and conquer value learning for GCRL
@@ -62,6 +61,18 @@ class TRLAgent(flax.struct.PyTreeNode):
         Equation (9) establishes the Q-based Bellman update. Section 4.3.1 uses
         this update rule in the TRL value loss computation in Equation (11).
         """
+        if self.config['use_oracle_distillation']:
+            goal_key = 'oracle_s_j'
+            midpoint_key = 'oracle_s_k'
+            if goal_key not in batch or midpoint_key not in batch:
+                raise KeyError(
+                    f'use_oracle_distillation=True but batch missing keys: {goal_key}, {midpoint_key}. '
+                    f'Batch keys: {list(batch.keys())}'
+                )
+        else:
+            goal_key = 's_j'
+            midpoint_key = 's_k'
+
         # 1. Get subgoal batch
         subgoal_batch = batch
 
@@ -76,7 +87,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 2. Compute the target of the first trajectory chunk
         #    If k - i <= 1: \bar{Q}(s_i, a_i, s_k) = \gamma^{k - i}
         first_leg_logits = self.network.select('target_critic')(
-            subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
+            subgoal_batch['s_i'], subgoal_batch[midpoint_key], subgoal_batch['a_i']
         )
         first_leg_logits = reduce_critic_output(first_leg_logits)
 
@@ -91,7 +102,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 3. Compute the target of the second trajectory chunk
         #    If j - k <= 1: \bar{Q}(s_k, a_k, s_j) = \gamma^{j - k}
         second_leg_logits = self.network.select('target_critic')(
-            subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
+            subgoal_batch[midpoint_key], subgoal_batch[goal_key], subgoal_batch['a_k']
         )
 
         second_leg_logits = reduce_critic_output(second_leg_logits)
@@ -161,8 +172,8 @@ class TRLAgent(flax.struct.PyTreeNode):
         # so that inputs are in (0, 1) and the loss is well-behaved. 
         # In general, if something looks like it should be a probability or bounded between 0 and 1, it probably is a label
         # For consistancy's sake I labeled what goes into the expectile loss as "logits" and what goes into the distance weight as "labels"
-        
-        # 1. Evaluate the online critic on Q(s_i, a_i, s_j)
+
+        # 1. Evaluate the student critic on Q(s_i, a_i, s_j)
         critic_logits = self.network.select('critic')(
             batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
         )
@@ -179,6 +190,18 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 4. Compute distance-based re-weighted loss
         weights = self.distance_weight(critic_logits=critic_logits)
         critic_loss = (expectile_loss * weights).mean()
+
+        if self.config['use_oracle_distillation']:
+            oracle_logits = self.network.select('oracle_critic')(
+                batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
+            )
+            if oracle_logits.ndim > batch['leg1_len'].ndim:
+                oracle_logits = jnp.min(oracle_logits, axis=0)
+
+            oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
+                oracle_logits, jax.lax.stop_gradient(jax.nn.sigmoid(critic_logits))
+            ).mean()
+            critic_loss = critic_loss + oracle_distill_loss
 
         return critic_loss, {
             'critic_loss': critic_loss,
@@ -239,9 +262,29 @@ class TRLAgent(flax.struct.PyTreeNode):
                 'q_min': q_vals.min(),
                 'log_prob_mean': log_prob.mean(),
             }
+        
         elif self.config['policy_extraction'] == 'rejection':
-            # FLAGGED: This is a placeholder for the rejection sampling policy extraction method, which is not currently implemented.
-            raise NotImplementedError("Rejection sampling policy extraction is not yet implemented.")
+            assert not self.config['discrete']
+            rng = rng if rng is not None else self.rng
+            batch_size, action_dim = batch['a_i'].shape
+            x_rng, t_rng = jax.random.split(rng, 2)
+
+            x_0 = jax.random.normal(x_rng, shape=(batch_size, action_dim))
+            x_1 = batch['a_i']
+            t = jax.random.uniform(t_rng, shape=(batch_size, 1))
+            x_t = t * x_1 + (1 - t) * x_0
+            y = x_1 - x_0
+
+            pred = self.network.select('actor')(batch['s_i'], batch['s_j'], x_t, t, params = grad_params)
+
+            actor_loss = jnp.mean((pred - y) ** 2)
+
+            return actor_loss, {
+                "actor_loss": actor_loss,
+                "pred_mean": pred.mean(),
+                "pred_max": pred.max(),
+
+            }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -288,13 +331,15 @@ class TRLAgent(flax.struct.PyTreeNode):
             # 3. Compute Polyak average of model parameters
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
             # 1. Read current critic parameters.
-            self.network.params[f'modules_{module_name}'],
+            network.params[f'modules_{module_name}'],
             # 2. Read target critic parameters (lagged copy for stability).
-            self.network.params[f'modules_target_{module_name}'],
+            network.params[f'modules_target_{module_name}'],
         )
 
-        # 4. Write new target parameters.
-        network.params[f'modules_target_{module_name}'] = new_target_params
+        # 4. Write new target parameters and return updated network.
+        new_params = network.params.copy()
+        new_params[f'modules_target_{module_name}'] = new_target_params
+        return network.replace(params=new_params)
 
     @jax.jit
     def update(self, batch):
@@ -318,7 +363,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
         # 3. Update target critic
-        self.target_update(new_network, 'critic')
+        new_network = self.target_update(new_network, 'critic')
 
         # 4. Return new agent and information dictionary
         return self.replace(network=new_network, rng=new_rng), info
@@ -352,25 +397,50 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         # Extract policy according to rejection sampling
         elif self.config['policy_extraction'] == 'rejection':
-            # FLAGGED: Actions seem to be sampled from a BC policy-- is this
-            #          separate from the actual policy that we're training???
-            #          THIS IS DEFINITELY WRONG!!!
+            assert not self.config['discrete']
             # equation: \pi(a | s, g) argmax_{a_1, ... a_n, a_i ~ \pi^\beta (a | s, g)} Q(s, a_i, g)
             # where \pi^\beta is a goal-condition BC policy separate from the actual policy
             # the BC policy is modeled by an expressive generation model (diffusion mode) and flow matching
-            raise NotImplementedError("Rejection sampling is not yet implemented.")
+
+            pe_info = self.config['rejection']
+
+            n_obs = jnp.repeat(jnp.expand_dims(observations, 0), repeats=pe_info.num_samples, axis=0) # 
+            n_goals = jnp.repeat(jnp.expand_dims(goals, 0), repeats=pe_info.num_samples, axis=0) 
+            if seed is None:
+                raise ValueError('sample_actions requires a PRNG seed for rejection policy extraction.')
+            n_actions = jax.random.normal(
+                seed,
+                (
+                    pe_info.num_samples,
+                    *observations.shape[:-1],
+                    self.network.select('actor').action_dim,
+                ),
+            )
+
+            # for each time step, update the sampled actions with the velocity from the flow model
+            for i in range(pe_info.flow_steps):
+                t = jnp.full(
+                    (pe_info.num_samples, *observations.shape[:-1], 1),
+                    i / pe_info.flow_steps,
+                )
+                vels = self.network.select('actor')(n_obs, n_goals, n_actions, t) # get velocity from flow model
+                n_actions = n_actions + vels / pe_info.flow_steps # update actions with velocity
             
-            # 1. Sample behavioral action samples from a goal-conditioned BC policy
-            dist = self.network.select('actor')(observations, goals, temperature=temperature)
-            # how to generate the behavioral action samples?
-            ###
-            # FLAGGED: This is a placeholder for sampling from the BC policy, which is not currently implemented.
-            ###
-            q_actions = dist.sample(seed=seed)
-            # 2. Compute Q(s, a, g) \forall a \in A
-            q = self.network.select('critic')(observations, goals, q_actions)
-            # 3. Determine a* that maximizes 
-            actions = q_actions[jnp.argmax(q)]
+            n_actions = jnp.clip(n_actions, -1, 1) # clip actions to be in action space
+
+            # Always use main critic for policy extraction (never use oracle_critic which is for training distillation only)
+            q = self.network.select('critic')(n_obs, goals=n_goals, actions=n_actions) # evaluate Q for all sampled actions
+            if q.ndim > n_actions.ndim - 1:
+                q = jnp.min(q, axis=0)
+
+            # Determine a* that maximizes 
+            if len(observations.shape) == 2:
+                actions = n_actions[
+                    jnp.argmax(q, axis=0), jnp.arange(observations.shape[0])
+                ]
+            else:
+                actions = n_actions[jnp.argmax(q, axis=0)] # select action with highest Q for each observation
+            
         return actions
 
     @classmethod
@@ -401,6 +471,7 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         # 2. Define action dimension from example observations
         ex_goals = ex_observations
+        ex_times = ex_actions[..., :1]
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
@@ -415,7 +486,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         #     encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
 
         # 3. Define actor-critic network
-        if config['discrete']:
+        if config['discrete']: # do we need this?
             actor_def = GCDiscreteActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
@@ -425,10 +496,20 @@ class TRLAgent(flax.struct.PyTreeNode):
             critic_def = GCDiscreteCritic(
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
-                ensemble=True,  # FLAGGED: Does TRL use ensemble value functions?
+                ensemble=True,
                 # gc_encoder=encoders.get('critic'),
                 action_dim=action_dim,
             )
+
+            oracle_critic_def = GCDiscreteCritic(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                # gc_encoder=encoders.get('critic'),
+                action_dim=action_dim,
+            )
+
+            ex_actor_input = (ex_observations, ex_goals)
         else:
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -444,14 +525,33 @@ class TRLAgent(flax.struct.PyTreeNode):
             critic_def = GCValue(
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
-                ensemble=True,  # FLAGGED: Does TRL use ensemble value functions?
+                ensemble=True,
                 # gc_encoder=encoders.get('critic'),
             )
 
+            oracle_critic_def = GCValue(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                # gc_encoder=encoders.get('critic'),
+            )
+
+            ex_actor_input = (ex_observations, ex_goals)
+
+        if config["policy_extraction"] == 'rejection':
+            assert not config['discrete']
+            actor_def = ActorVectorField(
+                hidden_dims=config["actor_hidden_dims"],
+                action_dim=action_dim,
+                layer_norm=config["layer_norm"],
+            )
+            ex_actor_input = (ex_observations, ex_goals, ex_actions, ex_times)
+
         # 4. Initialize network parameters
         network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, ex_actor_input),
             critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
+            oracle_critic = (oracle_critic_def, (ex_observations, ex_goals, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
@@ -487,15 +587,17 @@ def get_config():
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.999,  # Discount factor.
             tau=0.005,  # Model parameter update rate for Polyak average.
-            alpha=0.1,  # BC coefficient in DDPG+BC
+            alpha=0.1,  # BC coefficient in DDPG+BC 
             expectile=0.7,  # Parameter for expectile regression loss.
-            distance_weight_lambda=0.0,  # Distance-based re-weighting parameter.
+            distance_weight_lambda=0.0,  # Distance-based re-weighting parameter. 
             critic_loss_weight=1.0,  # Coefficient for critic loss in total loss.
             actor_loss_weight=1.0,  # Coefficient for actor loss in total loss.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=None,  # Unused, all environments are state-based, not pixel-based.
             policy_extraction='ddpgbc',  # Method ('ddpgbc' or 'rejection') for policy extraction.
+            ddpgc=ml_collections.ConfigDict(dict(alpha =0.03, const_std=True)), # hyperparameters for the ddpg+bc policy extraction method, used when policy_extraction='ddpgbc'
+            rejection=ml_collections.ConfigDict(dict(num_samples=32, flow_steps=10)), # hyperparameters for the rejection sampling policy extraction method, used when policy_extraction='rejection'
             use_oracle_distillation=False,
             # Dataset hyperparameters.
             dataset_class='TRLDataset',  # Dataset class name.
