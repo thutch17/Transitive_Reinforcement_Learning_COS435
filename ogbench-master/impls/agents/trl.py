@@ -272,13 +272,18 @@ class TRLAgent(flax.struct.PyTreeNode):
 
             pred = self.network.select('actor')(batch['s_i'], batch['s_j'], x_t, t, params = grad_params)
 
-            actor_loss = jnp.mean((pred - y) ** 2)
+            q_vals = self.network.select('critic')(batch['s_i'], batch['s_j'], batch['a_i'])
+            if q_vals.ndim > batch['leg1_len'].ndim:
+                q_vals = jnp.min(q_vals, axis=0)
 
+            actor_loss = jnp.mean((pred - y) ** 2)
             return actor_loss, {
                 "actor_loss": actor_loss,
                 "pred_mean": pred.mean(),
                 "pred_max": pred.max(),
-
+                'q_mean': q_vals.mean(),
+                'q_max': q_vals.max(),
+                'q_min': q_vals.min(),
             }
 
     @jax.jit
@@ -403,7 +408,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             n_actions = jax.random.normal(seed, (
                     pe_info.num_samples,
                     *observations.shape[:-1],
-                    self.network.select('actor').action_dim,
+                    self.network.model_def.modules['actor'].action_dim,
                 ),
             )
 
