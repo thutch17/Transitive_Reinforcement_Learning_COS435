@@ -414,6 +414,10 @@ class TRLDataset:
         self.observations = dataset['observations']
         self.actions = dataset['actions']
         self.terminals = dataset['terminals']
+        try:
+            self.oracle_reps = dataset['oracle_reps']
+        except KeyError:
+            self.oracle_reps = None
         self.config = config
         (self.ends,) = np.nonzero(self.terminals == 1)
         self.starts = np.concatenate([[0], self.ends[:-1] + 1])
@@ -461,6 +465,8 @@ class TRLDataset:
         k_idxs = starts + k_offsets
 
         # steps 3/4
+        # use oracle reps as goals if available (for oraclerep environments), else fall back to full-state obs
+        goals = self.oracle_reps if self.oracle_reps is not None else self.observations
         return {
             # Maintained 'observations' and 'actions' for compatibility
             'observations': self.observations[i_idxs],
@@ -472,6 +478,10 @@ class TRLDataset:
             'a_j': self.actions[j_idxs],
             's_k': self.observations[k_idxs],
             'a_k': self.actions[k_idxs],
+            # goal representations (oracle rep when available, else full-state obs)
+            'g_i': goals[i_idxs],
+            'g_j': goals[j_idxs],
+            'g_k': goals[k_idxs],
             'leg1_len': k_idxs - i_idxs,
             'leg2_len': j_idxs - k_idxs,
         }

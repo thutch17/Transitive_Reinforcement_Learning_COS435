@@ -81,12 +81,15 @@ def main(_):
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
 
+    example_goal = example_batch['g_j']
+
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
         example_batch['observations'],
         example_batch['actions'],
         config,
+        ex_goals=example_goal,
     )
 
     # Restore agent.

@@ -76,7 +76,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 2. Compute the target of the first trajectory chunk
         #    If k - i <= 1: \bar{Q}(s_i, a_i, s_k) = \gamma^{k - i}
         first_leg_logits = self.network.select('target_critic')(
-            subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
+            subgoal_batch['s_i'], subgoal_batch['g_k'], subgoal_batch['a_i']
         )
         first_leg_logits = reduce_critic_output(first_leg_logits)
 
@@ -91,7 +91,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 3. Compute the target of the second trajectory chunk
         #    If j - k <= 1: \bar{Q}(s_k, a_k, s_j) = \gamma^{j - k}
         second_leg_logits = self.network.select('target_critic')(
-            subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
+            subgoal_batch['s_k'], subgoal_batch['g_j'], subgoal_batch['a_k']
         )
 
         second_leg_logits = reduce_critic_output(second_leg_logits)
@@ -162,9 +162,9 @@ class TRLAgent(flax.struct.PyTreeNode):
         # In general, if something looks like it should be a probability or bounded between 0 and 1, it probably is a label
         # For consistancy's sake I labeled what goes into the expectile loss as "logits" and what goes into the distance weight as "labels"
 
-        # 1. Evaluate the student critic on Q(s_i, a_i, s_j)
+        # 1. Evaluate the student critic on Q(s_i, a_i, g_j)
         critic_logits = self.network.select('critic')(
-            batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
+            batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
         )
         if critic_logits.ndim > batch['leg1_len'].ndim:
             critic_logits = jnp.min(critic_logits, axis=0)
@@ -183,7 +183,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # is using oracle distillation, also compute distillation loss and add to critic loss
         if self.config['use_oracle_distillation']:
             oracle_logits = self.network.select('oracle_critic')(
-                batch['s_i'], batch['s_j'], batch['a_i'], params=grad_params
+                batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
             )
 
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
@@ -224,14 +224,14 @@ class TRLAgent(flax.struct.PyTreeNode):
         if self.config['policy_extraction'] == 'ddpgbc':
             # step 1
             dist = self.network.select('actor')(
-                batch['s_i'], batch['s_j'], params=grad_params
+                batch['s_i'], batch['g_j'], params=grad_params
             )
             rng = rng if rng is not None else self.rng
             actions = dist.sample(seed=rng)
 
             # step 2
             q_vals = self.network.select('critic')(
-                batch['s_i'], batch['s_j'], actions
+                batch['s_i'], batch['g_j'], actions
             )
             # again take min? this can change but want conservative updates
             if q_vals.ndim > batch['leg1_len'].ndim:
@@ -264,9 +264,9 @@ class TRLAgent(flax.struct.PyTreeNode):
             x_t = t * x_1 + (1 - t) * x_0
             y = x_1 - x_0
 
-            pred = self.network.select('actor')(batch['s_i'], batch['s_j'], x_t, t, params = grad_params)
+            pred = self.network.select('actor')(batch['s_i'], batch['g_j'], x_t, t, params = grad_params)
 
-            q_vals = self.network.select('critic')(batch['s_i'], batch['s_j'], batch['a_i'])
+            q_vals = self.network.select('critic')(batch['s_i'], batch['g_j'], batch['a_i'])
             if q_vals.ndim > batch['leg1_len'].ndim:
                 q_vals = jnp.min(q_vals, axis=0)
 
@@ -439,6 +439,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_goals=None,
     ):
         """Create a new agent.
 
@@ -454,13 +455,20 @@ class TRLAgent(flax.struct.PyTreeNode):
         - equation (11) needs an online critic and a target critic
         - section 4.3.2 needs a policy module for extraction
         """
+        print("Update: TRLAgent.create is being called v1")
+        # print(f"DEBUG TRL.create: ex_observations shape: {ex_observations.shape}")
+        # print(f"DEBUG TRL.create: ex_actions shape: {ex_actions.shape}")
+        
         # 1. Initialize the RNG key
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
         # 2. Define action dimension from example observations
-        ex_goals = ex_observations
+        # Use provided example goals when available; fall back to observations.
+        ex_goals = ex_goals if ex_goals is not None else ex_observations
         ex_times = ex_actions[..., :1]
+        # print(f"DEBUG TRL.create: ex_goals shape: {ex_goals.shape}")
+        # print(f"DEBUG TRL.create: concatenated input would be shape: ({ex_observations.shape[-1]} + {ex_goals.shape[-1]}) = {ex_observations.shape[-1] + ex_goals.shape[-1]}")
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
@@ -534,6 +542,8 @@ class TRLAgent(flax.struct.PyTreeNode):
             ex_actor_input = (ex_observations, ex_goals, ex_actions, ex_times)
 
         # 4. Initialize network parameters
+        # print(f"DEBUG TRL.create: ex_actor_input shapes: {[x.shape for x in ex_actor_input]}")
+        # print(f"DEBUG TRL.create: critic input shapes: ({ex_observations.shape}, {ex_goals.shape}, {ex_actions.shape})")
         network_info = dict(
             actor=(actor_def, ex_actor_input),
             critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
@@ -545,6 +555,8 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         network_def = ModuleDict(networks)
         network_params = network_def.init(init_rng, **network_args)['params']
+        
+        # print(f"DEBUG TRL.create: network_params['modules_actor'] first layer kernel shape: {network_params['modules_actor']['actor_net']['Dense_0']['kernel'].shape}")
         
         # 5. Initialize critic and target critic with same parameters
         params = network_params
