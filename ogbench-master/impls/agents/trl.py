@@ -61,13 +61,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         Equation (9) establishes the Q-based Bellman update. Section 4.3.1 uses
         this update rule in the TRL value loss computation in Equation (11).
         """
-        if self.config['use_oracle_distillation']:
-            goal_key = 'oracle_s_j'
-            midpoint_key = 'oracle_s_k'
-        else:
-            goal_key = 's_j'
-            midpoint_key = 's_k'
-
+        
         # 1. Get subgoal batch
         subgoal_batch = batch
 
@@ -82,7 +76,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 2. Compute the target of the first trajectory chunk
         #    If k - i <= 1: \bar{Q}(s_i, a_i, s_k) = \gamma^{k - i}
         first_leg_logits = self.network.select('target_critic')(
-            subgoal_batch['s_i'], subgoal_batch[midpoint_key], subgoal_batch['a_i']
+            subgoal_batch['s_i'], subgoal_batch['s_k'], subgoal_batch['a_i']
         )
         first_leg_logits = reduce_critic_output(first_leg_logits)
 
@@ -97,7 +91,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 3. Compute the target of the second trajectory chunk
         #    If j - k <= 1: \bar{Q}(s_k, a_k, s_j) = \gamma^{j - k}
         second_leg_logits = self.network.select('target_critic')(
-            subgoal_batch[midpoint_key], subgoal_batch[goal_key], subgoal_batch['a_k']
+            subgoal_batch['s_k'], subgoal_batch['s_j'], subgoal_batch['a_k']
         )
 
         second_leg_logits = reduce_critic_output(second_leg_logits)
@@ -588,7 +582,7 @@ def get_config():
             discrete=False,  # Whether the action space is discrete.
             encoder=None,  # Unused, all environments are state-based, not pixel-based.
             policy_extraction='rejection',  # Method ('ddpgbc' or 'rejection') for policy extraction.
-            ddpgc=ml_collections.ConfigDict(dict(alpha =0.03, const_std=True)), # hyperparameters for the ddpg+bc policy extraction method, used when policy_extraction='ddpgbc'
+            ddpgbc=ml_collections.ConfigDict(dict(alpha =0.03, const_std=True)), # hyperparameters for the ddpg+bc policy extraction method, used when policy_extraction='ddpgbc'
             rejection=ml_collections.ConfigDict(dict(num_samples=32, flow_steps=10)), # hyperparameters for the rejection sampling policy extraction method, used when policy_extraction='rejection'
             use_oracle_distillation=False, # Whether oracle distillation is used
             # Dataset hyperparameters.
@@ -598,9 +592,9 @@ def get_config():
             value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
             value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
-            actor_p_trajgoal=0.0,  # Probability of using a future state in the same trajectory as the actor goal.
-            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
-            actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
+            actor_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the actor goal.
+            actor_p_randomgoal=0.5,  # Probability of using a random state as the actor goal.
+            actor_geom_sample=True,  # Whether to use geometric sampling for future actor goals.
             gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=None,  # Number of frames to stack.
