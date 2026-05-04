@@ -72,7 +72,6 @@ def evaluate(
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
-        episode_return = 0.0
         episode_length = 0
 
         observation, info = env.reset(options=dict(task_id=task_id, render_goal=False)) # dont render anything
@@ -90,7 +89,6 @@ def evaluate(
 
             next_observation, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            episode_return += float(reward)
             episode_length += 1
 
             if should_render and (episode_length % video_frame_skip == 0 or done):
@@ -112,13 +110,13 @@ def evaluate(
             observation = next_observation
         if i < num_eval_episodes:
             add_to(stats, flatten(info))
-            stats['return'].append(episode_return)
-            stats['length'].append(episode_length)
             trajs.append(traj)
         else:
             renders.append(np.array(render))
-
+    
+    std_success = np.std(stats["success"]) if "success" in stats else 0.0
     for k, v in stats.items():
         stats[k] = np.mean(v)
+    stats["std_success"] = std_success
 
     return stats, trajs, renders

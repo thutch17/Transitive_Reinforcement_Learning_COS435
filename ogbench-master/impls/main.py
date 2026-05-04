@@ -120,7 +120,6 @@ def main(_):
             train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
-        # if i == 1 or i % FLAGS.eval_interval == 0:
         if i % FLAGS.eval_interval == 0: # remove first evaluation to speed up training, since the agent is untrained at this point and evaluation is slow
             if FLAGS.eval_on_cpu:
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
@@ -145,7 +144,7 @@ def main(_):
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
                 renders.extend(cur_renders)
-                metric_names = ['success', 'return', 'length']
+                metric_names = ['success', 'std_success']
                 eval_metrics.update(
                     {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
                 )
