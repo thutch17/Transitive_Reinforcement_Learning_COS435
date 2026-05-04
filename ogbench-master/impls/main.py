@@ -20,7 +20,7 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_vi
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('run_group', 'Evaluation', 'Run group.') # make sure to set different run groups for different experiments to avoid confusion in WandB
+flags.DEFINE_string('run_group', 'Evaluation_1', 'Run group.') # make sure to set different run groups for different experiments to avoid confusion in WandB
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
