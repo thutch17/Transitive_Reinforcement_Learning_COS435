@@ -20,7 +20,7 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_vi
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('run_group', 'Debug', 'Run group.')
+flags.DEFINE_string('run_group', 'Evaluation', 'Run group.') # make sure to set different run groups for different experiments to avoid confusion in WandB
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
@@ -28,15 +28,15 @@ flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
-flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
-flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_integer('log_interval', 10000, 'Logging interval.')
+flags.DEFINE_integer('eval_interval', 250000, 'Evaluation interval.')
+flags.DEFINE_integer('save_interval', 5000000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
-flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
+flags.DEFINE_integer('eval_episodes', 10, 'Number of episodes for each task.') # originally 20, changed to 10 to speed up evaluation (TRL implementation did 15)
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
-flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
+flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.') # set to 0 to avoid OOM on GPU, we will handle video rendering separately
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
@@ -120,7 +120,8 @@ def main(_):
             train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
-        if i == 1 or i % FLAGS.eval_interval == 0:
+        # if i == 1 or i % FLAGS.eval_interval == 0:
+        if i % FLAGS.eval_interval == 0: # remove first evaluation to speed up training, since the agent is untrained at this point and evaluation is slow
             if FLAGS.eval_on_cpu:
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
             else:
@@ -144,7 +145,7 @@ def main(_):
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
                 renders.extend(cur_renders)
-                metric_names = ['success']
+                metric_names = ['success', 'return', 'length']
                 eval_metrics.update(
                     {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
                 )

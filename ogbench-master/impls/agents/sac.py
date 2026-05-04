@@ -138,6 +138,7 @@ class SACAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_goals=None, # this doesn't actually do anything but it makes the API consistent with other agents
     ):
         """Create a new agent.
 

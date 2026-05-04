@@ -72,12 +72,13 @@ def evaluate(
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
+        episode_return = 0.0
+        episode_length = 0
 
-        observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
+        observation, info = env.reset(options=dict(task_id=task_id, render_goal=False)) # dont render anything
         goal = info.get('goal')
         goal_frame = info.get('goal_rendered')
         done = False
-        step = 0
         render = []
         while not done:
             action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
@@ -89,9 +90,10 @@ def evaluate(
 
             next_observation, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            step += 1
+            episode_return += float(reward)
+            episode_length += 1
 
-            if should_render and (step % video_frame_skip == 0 or done):
+            if should_render and (episode_length % video_frame_skip == 0 or done):
                 frame = env.render().copy()
                 if goal_frame is not None:
                     render.append(np.concatenate([goal_frame, frame], axis=0))
@@ -110,6 +112,8 @@ def evaluate(
             observation = next_observation
         if i < num_eval_episodes:
             add_to(stats, flatten(info))
+            stats['return'].append(episode_return)
+            stats['length'].append(episode_length)
             trajs.append(traj)
         else:
             renders.append(np.array(render))

@@ -182,6 +182,11 @@ class GCDataset:
     def __post_init__(self):
         self.size = self.dataset.size
 
+        try:
+            self.oracle_reps = self.dataset['oracle_reps']
+        except KeyError:
+            self.oracle_reps = None
+
         # Pre-compute trajectory boundaries.
         (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
@@ -222,6 +227,8 @@ class GCDataset:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
+        goals = self.oracle_reps if self.oracle_reps is not None else None
+
         value_goal_idxs = self.sample_goals(
             idxs,
             self.config['value_p_curgoal'],
@@ -237,8 +244,16 @@ class GCDataset:
             self.config['actor_geom_sample'],
         )
 
-        batch['value_goals'] = self.get_observations(value_goal_idxs)
-        batch['actor_goals'] = self.get_observations(actor_goal_idxs)
+        if goals is None:
+            batch['value_goals'] = self.get_observations(value_goal_idxs)
+            batch['actor_goals'] = self.get_observations(actor_goal_idxs)
+        else:
+            batch['value_goals'] = goals[value_goal_idxs]
+            batch['actor_goals'] = goals[actor_goal_idxs]
+
+        batch['g_j'] = batch['value_goals']
+
+
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
@@ -338,6 +353,8 @@ class HGCDataset(GCDataset):
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
+        goals = self.oracle_reps if self.oracle_reps is not None else None
+
         # Sample value goals.
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -346,7 +363,12 @@ class HGCDataset(GCDataset):
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
         )
-        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        if goals is None:
+            batch['value_goals'] = self.get_observations(value_goal_idxs)
+        else:
+            batch['value_goals'] = goals[value_goal_idxs]
+        
+        batch['g_j'] = batch['value_goals']
 
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
@@ -355,7 +377,10 @@ class HGCDataset(GCDataset):
         # Set low-level actor goals.
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
         low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
-        batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+        if goals is None:
+            batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+        else:
+            batch['low_actor_goals'] = goals[low_goal_idxs]
 
         # Sample high-level actor goals and set prediction targets.
         # High-level future goals.
@@ -380,8 +405,12 @@ class HGCDataset(GCDataset):
         high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
         high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
 
-        batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
-        batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        if goals is None:
+            batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
+            batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        else:
+            batch['high_actor_goals'] = goals[high_goal_idxs]
+            batch['high_actor_targets'] = goals[high_target_idxs]
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:

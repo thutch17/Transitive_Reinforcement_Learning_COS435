@@ -153,6 +153,7 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_goals=None,
     ):
         """Create a new agent.
 
@@ -165,7 +166,7 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        ex_goals = ex_observations
+        ex_goals = ex_observations if ex_goals is None else ex_goals
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:

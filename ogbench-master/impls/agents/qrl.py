@@ -201,6 +201,7 @@ class QRLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_goals=None,
     ):
         """Create a new agent.
 
@@ -213,7 +214,7 @@ class QRLAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        ex_goals = ex_observations
+        ex_goals = ex_observations if ex_goals is None else ex_goals
         ex_latents = np.zeros((ex_observations.shape[0], config['latent_dim']), dtype=np.float32)
         if config['discrete']:
             action_dim = ex_actions.max() + 1
