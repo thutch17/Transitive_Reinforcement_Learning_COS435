@@ -458,9 +458,12 @@ class TRLDataset:
 
         pseudocode:
         1. pick random trajectories
-        2. sample i, then j > i, then k in [i, j-1]
-        3. index into observations/actions arrays
-        4. return dict:
+        2. sample i, then j > i
+        3. choose k in [i, j-1] according to config['subgoal_strategy']
+           - 'uniform': original TRL baseline
+           - 'midpoint': smarter/balanced divide-and-conquer extension
+        4. index into observations/actions arrays
+        5. return dict:
            - s_i, a_i, s_j, a_j, s_k, a_k
            - leg1_len (k - i), leg2_len (j - k)
         
@@ -477,8 +480,9 @@ class TRLDataset:
         i_offsets = (np.random.rand(batch_size) * (max_i_offset + 1)).astype(int)
         i_idxs = starts + i_offsets
 
-        # step 2
+        # step 3: choose j > i within the same trajectory
         num_j = lengths - i_offsets - 1
+
         # geometric offset instead of uniform
         if self.config['value_geom_sample']:
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
@@ -488,18 +492,33 @@ class TRLDataset:
             j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
         j_idxs = starts + j_offsets
 
-        # step 2
+        # step 4: choose subgoal k in [i, j-1]
         k_span = j_offsets - i_offsets
-        k_offsets = i_offsets + (np.random.rand(batch_size) * k_span).astype(int)
+        subgoal_strategy = self.config.get('subgoal_strategy', 'uniform')
+
+        if subgoal_strategy == 'uniform':
+            # Original TRL baseline: sample k uniformly from {i, ..., j-1}.
+            k_offsets = i_offsets + (np.random.rand(batch_size) * k_span).astype(int)
+
+        elif subgoal_strategy == 'midpoint':
+            # Smarter subgoal extension: choose the most balanced in-trajectory split.
+            # Since k must be in [i, j-1], this keeps k valid while making
+            # leg1_len and leg2_len as balanced as possible.
+            k_offsets = i_offsets + np.maximum(k_span // 2, 0)
+
+        else:
+            raise ValueError(f'Unknown subgoal_strategy: {subgoal_strategy}')
+
         k_idxs = starts + k_offsets
 
-        # steps 3/4
+        # steps 5/6
         # use oracle reps as goals if available (for oraclerep environments), else fall back to full-state obs
         goals = self.oracle_reps if self.oracle_reps is not None else self.observations
         return {
             # Maintained 'observations' and 'actions' for compatibility
             'observations': self.observations[i_idxs],
             'actions': self.actions[i_idxs],
+
             # (i, j, k) triples
             's_i': self.observations[i_idxs],
             'a_i': self.actions[i_idxs],
@@ -507,10 +526,13 @@ class TRLDataset:
             'a_j': self.actions[j_idxs],
             's_k': self.observations[k_idxs],
             'a_k': self.actions[k_idxs],
+
             # goal representations (oracle rep when available, else full-state obs)
             'g_i': goals[i_idxs],
             'g_j': goals[j_idxs],
             'g_k': goals[k_idxs],
+
+            # lengths of the two transitive chunks
             'leg1_len': k_idxs - i_idxs,
             'leg2_len': j_idxs - k_idxs,
         }
