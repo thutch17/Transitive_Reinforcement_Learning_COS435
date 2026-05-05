@@ -586,11 +586,18 @@ def get_config():
             discrete=False,  # Whether the action space is discrete.
             encoder=None,  # Unused, all environments are state-based, not pixel-based.
             policy_extraction='rejection',  # Method ('ddpgbc' or 'rejection') for policy extraction.
-            ddpgbc=ml_collections.ConfigDict(dict(alpha =0.03, const_std=True)), # hyperparameters for the ddpg+bc policy extraction method, used when policy_extraction='ddpgbc'
-            rejection=ml_collections.ConfigDict(dict(num_samples=32, flow_steps=10)), # hyperparameters for the rejection sampling policy extraction method, used when policy_extraction='rejection'
-            use_oracle_distillation=False, # Whether oracle distillation is used
+            ddpgbc=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),
+            rejection=ml_collections.ConfigDict(dict(num_samples=32, flow_steps=10)),
+            use_oracle_distillation=False,  # Whether oracle distillation is used.
+
             # Dataset hyperparameters.
             dataset_class='TRLDataset',  # Dataset class name.
+
+            # NEW: TRL subgoal sampling strategy.
+            # 'uniform' = original TRL baseline from the paper (i.e. what we already had)
+            # 'midpoint' = smarter-subgoal extension
+            subgoal_strategy='uniform',
+
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
             value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
             value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
