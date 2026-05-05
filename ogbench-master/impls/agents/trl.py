@@ -55,51 +55,78 @@ class TRLAgent(flax.struct.PyTreeNode):
 
     def transitive_target(self, batch):
         """Compute the TRL target value.
-    
+
         Baseline / midpoint / noisy_midpoint:
             target = Qbar(s_i, a_i, s_k) * Qbar(s_k, a_k, s_j)
-    
+
         candidate_max:
             We receive several candidate subgoals k_m from the dataset and compute:
                 target_m = Qbar(s_i, a_i, s_{k_m}) * Qbar(s_{k_m}, a_{k_m}, s_j)
             Then we take max_m target_m.
-    
+
         This approximates the max-over-subgoals structure of the transitive Bellman
         update while restricting candidates to in-trajectory behavioral subgoals.
         """
-    
+
         def reduce_critic_output(values, leg_lengths):
             # If critic output has an ensemble dimension, take the conservative min.
             # Normal case:
             #   values: (ensemble, batch), leg_lengths: (batch,)
-            # Candidate case:
-            #   values: (ensemble, batch, num_candidates), leg_lengths: (batch, num_candidates)
+            # Candidate flattened case:
+            #   values: (ensemble, batch*num_candidates),
+            #   leg_lengths: (batch*num_candidates,)
             if values.ndim > leg_lengths.ndim:
                 return jnp.min(values, axis=0)
             return values
-    
+
         discount = self.config['discount']
-    
+
         use_candidate_max = (
             self.config.get('subgoal_strategy', 'uniform') == 'candidate_max'
             and 'g_k_candidates' in batch
         )
-    
+
         if use_candidate_max:
-            # Candidate tensors have shape (batch, num_candidates, dim).
+            # Candidate tensors start with shape:
+            #   s_k_candidates: (batch, num_candidates, obs_dim)
+            #   a_k_candidates: (batch, num_candidates, action_dim)
+            #   g_k_candidates: (batch, num_candidates, goal_dim)
+            #
+            # We flatten to:
+            #   (batch * num_candidates, dim)
+            # so target_critic sees an ordinary 2D batch, like in the original TRL path.
+            batch_size = batch['g_k_candidates'].shape[0]
             num_candidates = batch['g_k_candidates'].shape[1]
-    
-            # Repeat start state/action and final goal across the candidate dimension.
-            s_i = jnp.repeat(jnp.expand_dims(batch['s_i'], axis=1), repeats=num_candidates, axis=1)
-            a_i = jnp.repeat(jnp.expand_dims(batch['a_i'], axis=1), repeats=num_candidates, axis=1)
-            g_j = jnp.repeat(jnp.expand_dims(batch['g_j'], axis=1), repeats=num_candidates, axis=1)
-    
-            s_k = batch['s_k_candidates']
-            a_k = batch['a_k_candidates']
-            g_k = batch['g_k_candidates']
-            leg1_len = batch['leg1_len_candidates']
-            leg2_len = batch['leg2_len_candidates']
-    
+
+            # Repeat start state/action and final goal across candidate dimension.
+            s_i = jnp.repeat(
+                jnp.expand_dims(batch['s_i'], axis=1),
+                repeats=num_candidates,
+                axis=1,
+            )
+            a_i = jnp.repeat(
+                jnp.expand_dims(batch['a_i'], axis=1),
+                repeats=num_candidates,
+                axis=1,
+            )
+            g_j = jnp.repeat(
+                jnp.expand_dims(batch['g_j'], axis=1),
+                repeats=num_candidates,
+                axis=1,
+            )
+
+            # Flatten candidate dimension into batch dimension.
+            s_i = s_i.reshape((batch_size * num_candidates, -1))
+            a_i = a_i.reshape((batch_size * num_candidates, -1))
+            g_j = g_j.reshape((batch_size * num_candidates, -1))
+
+            s_k = batch['s_k_candidates'].reshape((batch_size * num_candidates, -1))
+            a_k = batch['a_k_candidates'].reshape((batch_size * num_candidates, -1))
+            g_k = batch['g_k_candidates'].reshape((batch_size * num_candidates, -1))
+
+            leg1_len = batch['leg1_len_candidates'].reshape((batch_size * num_candidates,))
+            leg2_len = batch['leg2_len_candidates'].reshape((batch_size * num_candidates,))
+
         else:
             # Original single-subgoal path.
             s_i = batch['s_i']
@@ -110,7 +137,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             g_k = batch['g_k']
             leg1_len = batch['leg1_len']
             leg2_len = batch['leg2_len']
-    
+
         # First trajectory chunk:
         # If k - i <= 1: Qbar(s_i, a_i, s_k) = gamma^(k-i)
         first_leg_logits = self.network.select('target_critic')(
@@ -118,13 +145,13 @@ class TRLAgent(flax.struct.PyTreeNode):
         )
         first_leg_logits = reduce_critic_output(first_leg_logits, leg1_len)
         first_leg_labels = jax.nn.sigmoid(first_leg_logits)
-    
+
         first_leg_labels = jnp.where(
             leg1_len <= 1,
             discount ** leg1_len,
             first_leg_labels,
         )
-    
+
         # Second trajectory chunk:
         # If j - k <= 1: Qbar(s_k, a_k, s_j) = gamma^(j-k)
         second_leg_logits = self.network.select('target_critic')(
@@ -132,23 +159,123 @@ class TRLAgent(flax.struct.PyTreeNode):
         )
         second_leg_logits = reduce_critic_output(second_leg_logits, leg2_len)
         second_leg_labels = jax.nn.sigmoid(second_leg_logits)
-    
+
         second_leg_labels = jnp.where(
             leg2_len <= 1,
             discount ** leg2_len,
             second_leg_labels,
         )
-    
-        # Candidate targets have shape (batch, num_candidates).
-        # Single-subgoal targets have shape (batch,).
+
+        # Candidate-max path:
+        #   target_labels starts as shape (batch*num_candidates,)
+        #   reshape to (batch, num_candidates), then max over candidates.
+        #
+        # Single-subgoal path:
+        #   target_labels is shape (batch,)
         target_labels = first_leg_labels * second_leg_labels
-    
+
         if use_candidate_max:
-            # Value-guided candidate selection: choose the candidate subgoal with
-            # the largest transitive target.
+            target_labels = target_labels.reshape((batch_size, num_candidates))
             target_labels = jnp.max(target_labels, axis=1)
-    
+
         return target_labels
+
+    # def transitive_target(self, batch):
+    #     """Compute the TRL target value.
+    
+    #     Baseline / midpoint / noisy_midpoint:
+    #         target = Qbar(s_i, a_i, s_k) * Qbar(s_k, a_k, s_j)
+    
+    #     candidate_max:
+    #         We receive several candidate subgoals k_m from the dataset and compute:
+    #             target_m = Qbar(s_i, a_i, s_{k_m}) * Qbar(s_{k_m}, a_{k_m}, s_j)
+    #         Then we take max_m target_m.
+    
+    #     This approximates the max-over-subgoals structure of the transitive Bellman
+    #     update while restricting candidates to in-trajectory behavioral subgoals.
+    #     """
+    
+    #     def reduce_critic_output(values, leg_lengths):
+    #         # If critic output has an ensemble dimension, take the conservative min.
+    #         # Normal case:
+    #         #   values: (ensemble, batch), leg_lengths: (batch,)
+    #         # Candidate case:
+    #         #   values: (ensemble, batch, num_candidates), leg_lengths: (batch, num_candidates)
+    #         if values.ndim > leg_lengths.ndim:
+    #             return jnp.min(values, axis=0)
+    #         return values
+    
+    #     discount = self.config['discount']
+    
+    #     use_candidate_max = (
+    #         self.config.get('subgoal_strategy', 'uniform') == 'candidate_max'
+    #         and 'g_k_candidates' in batch
+    #     )
+    
+    #     if use_candidate_max:
+    #         # Candidate tensors have shape (batch, num_candidates, dim).
+    #         num_candidates = batch['g_k_candidates'].shape[1]
+    
+    #         # Repeat start state/action and final goal across the candidate dimension.
+    #         s_i = jnp.repeat(jnp.expand_dims(batch['s_i'], axis=1), repeats=num_candidates, axis=1)
+    #         a_i = jnp.repeat(jnp.expand_dims(batch['a_i'], axis=1), repeats=num_candidates, axis=1)
+    #         g_j = jnp.repeat(jnp.expand_dims(batch['g_j'], axis=1), repeats=num_candidates, axis=1)
+    
+    #         s_k = batch['s_k_candidates']
+    #         a_k = batch['a_k_candidates']
+    #         g_k = batch['g_k_candidates']
+    #         leg1_len = batch['leg1_len_candidates']
+    #         leg2_len = batch['leg2_len_candidates']
+    
+    #     else:
+    #         # Original single-subgoal path.
+    #         s_i = batch['s_i']
+    #         a_i = batch['a_i']
+    #         s_k = batch['s_k']
+    #         a_k = batch['a_k']
+    #         g_j = batch['g_j']
+    #         g_k = batch['g_k']
+    #         leg1_len = batch['leg1_len']
+    #         leg2_len = batch['leg2_len']
+    
+    #     # First trajectory chunk:
+    #     # If k - i <= 1: Qbar(s_i, a_i, s_k) = gamma^(k-i)
+    #     first_leg_logits = self.network.select('target_critic')(
+    #         s_i, g_k, a_i
+    #     )
+    #     first_leg_logits = reduce_critic_output(first_leg_logits, leg1_len)
+    #     first_leg_labels = jax.nn.sigmoid(first_leg_logits)
+    
+    #     first_leg_labels = jnp.where(
+    #         leg1_len <= 1,
+    #         discount ** leg1_len,
+    #         first_leg_labels,
+    #     )
+    
+    #     # Second trajectory chunk:
+    #     # If j - k <= 1: Qbar(s_k, a_k, s_j) = gamma^(j-k)
+    #     second_leg_logits = self.network.select('target_critic')(
+    #         s_k, g_j, a_k
+    #     )
+    #     second_leg_logits = reduce_critic_output(second_leg_logits, leg2_len)
+    #     second_leg_labels = jax.nn.sigmoid(second_leg_logits)
+    
+    #     second_leg_labels = jnp.where(
+    #         leg2_len <= 1,
+    #         discount ** leg2_len,
+    #         second_leg_labels,
+    #     )
+    
+    #     # Candidate targets have shape (batch, num_candidates).
+    #     # Single-subgoal targets have shape (batch,).
+    #     target_labels = first_leg_labels * second_leg_labels
+    
+    #     if use_candidate_max:
+    #         # Value-guided candidate selection: choose the candidate subgoal with
+    #         # the largest transitive target.
+    #         target_labels = jnp.max(target_labels, axis=1)
+    
+    #     return target_labels
 
     def distance_weight(self, critic_logits):
         """Reweight samples so short chunks matter more b/c get bad cumluating bias if don't
