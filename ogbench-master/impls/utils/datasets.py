@@ -69,7 +69,7 @@ class Dataset(FrozenDict):
         else:
             return np.random.randint(self.size, size=num_idxs)
 
-    def sample(self, batch_size, idxs=None):
+    (self, batch_size, idxs=None):
         """Sample a batch of transitions."""
         if idxs is None:
             idxs = self.get_random_idxs(batch_size)
@@ -207,7 +207,7 @@ class GCDataset:
                 stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
-    def sample(self, batch_size, idxs=None, evaluation=False):
+    (self, batch_size, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals (value_goals and actor_goals) from the dataset. They are
@@ -264,7 +264,7 @@ class GCDataset:
 
         return batch
 
-    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
+    _goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
         """Sample goals for the given indices."""
         batch_size = len(idxs)
 
@@ -333,7 +333,7 @@ class HGCDataset(GCDataset):
     - subgoal_steps: Subgoal steps (i.e., the number of steps to reach the low-level goal).
     """
 
-    def sample(self, batch_size, idxs=None, evaluation=False):
+    (self, batch_size, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals from the dataset. The goals are stored in the keys
@@ -452,149 +452,149 @@ class TRLDataset:
         self.starts = np.concatenate([[0], self.ends[:-1] + 1])
         self.lengths = self.ends - self.starts + 1
 
-def sample(self, batch_size):
-    """
-    sample (i, j, k) triples for the TRL value loss
-
-    pseudocode:
-    1. pick random trajectories
-    2. sample i, then j > i
-    3. choose k in [i, j-1] according to config['subgoal_strategy']
-       - 'uniform': original TRL baseline
-       - 'midpoint': Extension 1, exact balanced split
-       - 'noisy_midpoint': Extension 2, near-balanced random split
-       - 'candidate_max': Extension 3, return several candidate subgoals
-         for the agent to score with the target critic
-    4. index into observations/actions arrays
-    5. return dict:
-       - s_i, a_i, s_j, a_j, s_k, a_k
-       - leg1_len (k - i), leg2_len (j - k)
-       - for candidate_max only: candidate versions of s_k, a_k, g_k, lengths
-
-    note: randomness uses np.random (seeded in main.py), same pattern as GCDataset.
-    """
-    # step 1 (trajectories of length 1 cannot satisfy i < j within the same traj)
-    valid_traj = np.nonzero(self.lengths >= 2)[0]
-    traj_idxs = valid_traj[np.random.randint(0, len(valid_traj), size=batch_size)]
-    starts = self.starts[traj_idxs]
-    lengths = self.lengths[traj_idxs]
-
-    # step 2: i_offset in [0, L-2] so j can lie in [i+1, L-1] relative to start
-    max_i_offset = np.maximum(lengths - 2, 0)
-    i_offsets = (np.random.rand(batch_size) * (max_i_offset + 1)).astype(int)
-    i_idxs = starts + i_offsets
-
-    # step 3: choose j > i within the same trajectory
-    num_j = lengths - i_offsets - 1
-
-    if self.config['value_geom_sample']:
-        offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
-        offsets = np.minimum(offsets, num_j)  # clip to trajectory bounds
-        j_offsets = i_offsets + offsets
-    else:
-        j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
-    j_idxs = starts + j_offsets
-
-    # step 4: choose subgoal k in [i, j-1]
-    k_span = j_offsets - i_offsets
-    subgoal_strategy = self.config.get('subgoal_strategy', 'uniform')
-
-    # These will stay None unless we use candidate_max.
-    candidate_idxs = None
-    candidate_offsets = None
-
-    if subgoal_strategy == 'uniform':
-        # Original TRL baseline: sample k uniformly from {i, ..., j-1}.
-        k_offsets = i_offsets + (np.random.rand(batch_size) * k_span).astype(int)
-
-    elif subgoal_strategy == 'midpoint':
-        # Extension 1: choose the most balanced in-trajectory split.
-        k_offsets = i_offsets + np.maximum(k_span // 2, 0)
-
-    elif subgoal_strategy == 'noisy_midpoint':
-        # Extension 2: choose a subgoal near the midpoint.
-        # This keeps splits mostly balanced while adding target diversity.
-        midpoint_offsets = i_offsets + np.maximum(k_span // 2, 0)
-        noise_radius = np.maximum(k_span // 4, 1)
-
-        # Sample integer noise in [-noise_radius, noise_radius].
-        noise = np.array([
-            np.random.randint(-r, r + 1) for r in noise_radius
-        ])
-
-        k_offsets = np.clip(midpoint_offsets + noise, i_offsets, j_offsets - 1)
-
-    elif subgoal_strategy == 'candidate_max':
-        # Extension 3: create several in-trajectory candidate subgoals.
-        # The agent will score them using the target critic and choose the best
-        # transitive target. We include the midpoint as the first candidate,
-        # then add random in-trajectory candidates for diversity.
-        num_candidates = int(self.config.get('subgoal_num_candidates', 4))
-        assert num_candidates >= 1
-
-        midpoint_offsets = (
-            i_offsets + np.maximum(k_span // 2, 0)
-        )[:, None]  # shape: (batch_size, 1)
-
-        if num_candidates > 1:
-            random_offsets = (
-                i_offsets[:, None]
-                + (np.random.rand(batch_size, num_candidates - 1) * k_span[:, None]).astype(int)
-            )
-            candidate_offsets = np.concatenate([midpoint_offsets, random_offsets], axis=1)
+    def sample(self, batch_size):
+        """
+        sample (i, j, k) triples for the TRL value loss
+    
+        pseudocode:
+        1. pick random trajectories
+        2. sample i, then j > i
+        3. choose k in [i, j-1] according to config['subgoal_strategy']
+           - 'uniform': original TRL baseline
+           - 'midpoint': Extension 1, exact balanced split
+           - 'noisy_midpoint': Extension 2, near-balanced random split
+           - 'candidate_max': Extension 3, return several candidate subgoals
+             for the agent to score with the target critic
+        4. index into observations/actions arrays
+        5. return dict:
+           - s_i, a_i, s_j, a_j, s_k, a_k
+           - leg1_len (k - i), leg2_len (j - k)
+           - for candidate_max only: candidate versions of s_k, a_k, g_k, lengths
+    
+        note: randomness uses np.random (seeded in main.py), same pattern as GCDataset.
+        """
+        # step 1 (trajectories of length 1 cannot satisfy i < j within the same traj)
+        valid_traj = np.nonzero(self.lengths >= 2)[0]
+        traj_idxs = valid_traj[np.random.randint(0, len(valid_traj), size=batch_size)]
+        starts = self.starts[traj_idxs]
+        lengths = self.lengths[traj_idxs]
+    
+        # step 2: i_offset in [0, L-2] so j can lie in [i+1, L-1] relative to start
+        max_i_offset = np.maximum(lengths - 2, 0)
+        i_offsets = (np.random.rand(batch_size) * (max_i_offset + 1)).astype(int)
+        i_idxs = starts + i_offsets
+    
+        # step 3: choose j > i within the same trajectory
+        num_j = lengths - i_offsets - 1
+    
+        if self.config['value_geom_sample']:
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
+            offsets = np.minimum(offsets, num_j)  # clip to trajectory bounds
+            j_offsets = i_offsets + offsets
         else:
-            candidate_offsets = midpoint_offsets
-
-        # Clip just to be extra safe.
-        candidate_offsets = np.clip(candidate_offsets, i_offsets[:, None], j_offsets[:, None] - 1)
-        candidate_idxs = starts[:, None] + candidate_offsets
-
-        # Compatibility: keep the old single-subgoal keys too.
-        # They will not be used for the candidate_max target, but this avoids
-        # breaking any code that expects s_k / a_k / g_k to exist.
-        k_offsets = candidate_offsets[:, 0]
-
-    else:
-        raise ValueError(f'Unknown subgoal_strategy: {subgoal_strategy}')
-
-    k_idxs = starts + k_offsets
-
-    # steps 5/6
-    # use oracle reps as goals if available (for oraclerep environments), else fall back to full-state obs
-    goals = self.oracle_reps if self.oracle_reps is not None else self.observations
-
-    batch = {
-        # Maintained 'observations' and 'actions' for compatibility
-        'observations': self.observations[i_idxs],
-        'actions': self.actions[i_idxs],
-
-        # (i, j, k) triples
-        's_i': self.observations[i_idxs],
-        'a_i': self.actions[i_idxs],
-        's_j': self.observations[j_idxs],
-        'a_j': self.actions[j_idxs],
-        's_k': self.observations[k_idxs],
-        'a_k': self.actions[k_idxs],
-
-        # goal representations (oracle rep when available, else full-state obs)
-        'g_i': goals[i_idxs],
-        'g_j': goals[j_idxs],
-        'g_k': goals[k_idxs],
-
-        # lengths of the two transitive chunks
-        'leg1_len': k_idxs - i_idxs,
-        'leg2_len': j_idxs - k_idxs,
-    }
-
-    if subgoal_strategy == 'candidate_max':
-        # Candidate subgoals have shape:
-        #   (batch_size, num_candidates, ...)
-        batch.update({
-            's_k_candidates': self.observations[candidate_idxs],
-            'a_k_candidates': self.actions[candidate_idxs],
-            'g_k_candidates': goals[candidate_idxs],
-            'leg1_len_candidates': candidate_idxs - i_idxs[:, None],
-            'leg2_len_candidates': j_idxs[:, None] - candidate_idxs,
-        })
-
-    return batch
+            j_offsets = i_offsets + 1 + (np.random.rand(batch_size) * num_j).astype(int)
+        j_idxs = starts + j_offsets
+    
+        # step 4: choose subgoal k in [i, j-1]
+        k_span = j_offsets - i_offsets
+        subgoal_strategy = self.config.get('subgoal_strategy', 'uniform')
+    
+        # These will stay None unless we use candidate_max.
+        candidate_idxs = None
+        candidate_offsets = None
+    
+        if subgoal_strategy == 'uniform':
+            # Original TRL baseline: sample k uniformly from {i, ..., j-1}.
+            k_offsets = i_offsets + (np.random.rand(batch_size) * k_span).astype(int)
+    
+        elif subgoal_strategy == 'midpoint':
+            # Extension 1: choose the most balanced in-trajectory split.
+            k_offsets = i_offsets + np.maximum(k_span // 2, 0)
+    
+        elif subgoal_strategy == 'noisy_midpoint':
+            # Extension 2: choose a subgoal near the midpoint.
+            # This keeps splits mostly balanced while adding target diversity.
+            midpoint_offsets = i_offsets + np.maximum(k_span // 2, 0)
+            noise_radius = np.maximum(k_span // 4, 1)
+    
+            # Sample integer noise in [-noise_radius, noise_radius].
+            noise = np.array([
+                np.random.randint(-r, r + 1) for r in noise_radius
+            ])
+    
+            k_offsets = np.clip(midpoint_offsets + noise, i_offsets, j_offsets - 1)
+    
+        elif subgoal_strategy == 'candidate_max':
+            # Extension 3: create several in-trajectory candidate subgoals.
+            # The agent will score them using the target critic and choose the best
+            # transitive target. We include the midpoint as the first candidate,
+            # then add random in-trajectory candidates for diversity.
+            num_candidates = int(self.config.get('subgoal_num_candidates', 4))
+            assert num_candidates >= 1
+    
+            midpoint_offsets = (
+                i_offsets + np.maximum(k_span // 2, 0)
+            )[:, None]  # shape: (batch_size, 1)
+    
+            if num_candidates > 1:
+                random_offsets = (
+                    i_offsets[:, None]
+                    + (np.random.rand(batch_size, num_candidates - 1) * k_span[:, None]).astype(int)
+                )
+                candidate_offsets = np.concatenate([midpoint_offsets, random_offsets], axis=1)
+            else:
+                candidate_offsets = midpoint_offsets
+    
+            # Clip just to be extra safe.
+            candidate_offsets = np.clip(candidate_offsets, i_offsets[:, None], j_offsets[:, None] - 1)
+            candidate_idxs = starts[:, None] + candidate_offsets
+    
+            # Compatibility: keep the old single-subgoal keys too.
+            # They will not be used for the candidate_max target, but this avoids
+            # breaking any code that expects s_k / a_k / g_k to exist.
+            k_offsets = candidate_offsets[:, 0]
+    
+        else:
+            raise ValueError(f'Unknown subgoal_strategy: {subgoal_strategy}')
+    
+        k_idxs = starts + k_offsets
+    
+        # steps 5/6
+        # use oracle reps as goals if available (for oraclerep environments), else fall back to full-state obs
+        goals = self.oracle_reps if self.oracle_reps is not None else self.observations
+    
+        batch = {
+            # Maintained 'observations' and 'actions' for compatibility
+            'observations': self.observations[i_idxs],
+            'actions': self.actions[i_idxs],
+    
+            # (i, j, k) triples
+            's_i': self.observations[i_idxs],
+            'a_i': self.actions[i_idxs],
+            's_j': self.observations[j_idxs],
+            'a_j': self.actions[j_idxs],
+            's_k': self.observations[k_idxs],
+            'a_k': self.actions[k_idxs],
+    
+            # goal representations (oracle rep when available, else full-state obs)
+            'g_i': goals[i_idxs],
+            'g_j': goals[j_idxs],
+            'g_k': goals[k_idxs],
+    
+            # lengths of the two transitive chunks
+            'leg1_len': k_idxs - i_idxs,
+            'leg2_len': j_idxs - k_idxs,
+        }
+    
+        if subgoal_strategy == 'candidate_max':
+            # Candidate subgoals have shape:
+            #   (batch_size, num_candidates, ...)
+            batch.update({
+                's_k_candidates': self.observations[candidate_idxs],
+                'a_k_candidates': self.actions[candidate_idxs],
+                'g_k_candidates': goals[candidate_idxs],
+                'leg1_len_candidates': candidate_idxs - i_idxs[:, None],
+                'leg2_len_candidates': j_idxs[:, None] - candidate_idxs,
+            })
+    
+        return batch
