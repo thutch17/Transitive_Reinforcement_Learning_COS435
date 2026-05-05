@@ -594,10 +594,13 @@ def get_config():
             dataset_class='TRLDataset',  # Dataset class name.
 
             # NEW: TRL subgoal sampling strategy.
-            # 'uniform' = original TRL baseline from the paper (i.e. what we already had)
-            # 'midpoint' = smarter-subgoal extension 1
-            # 'noisy_midpoint' = smarter-subgoal extension 2
-            subgoal_strategy='uniform', # Options: 'uniform', 'midpoint', 'noisy_midpoint'.
+            # TRL subgoal sampling strategy.
+            # 'uniform' = original TRL baseline.
+            # 'midpoint' = Extension 1: balanced midpoint subgoal.
+            # 'noisy_midpoint' = Extension 2: random near-midpoint subgoal.
+            # 'candidate_max' = Extension 3: value-guided max over candidate in-trajectory subgoals.
+            subgoal_strategy='uniform',
+            subgoal_num_candidates=4,  # Used only when subgoal_strategy='candidate_max'.
 
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
             value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
