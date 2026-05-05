@@ -506,6 +506,21 @@ class TRLDataset:
             # leg1_len and leg2_len as balanced as possible.
             k_offsets = i_offsets + np.maximum(k_span // 2, 0)
 
+        elif subgoal_strategy == 'noisy_midpoint':
+            # Extension 2: choose a subgoal near the midpoint.
+            # This keeps splits mostly balanced while adding target diversity.
+            midpoint_offsets = i_offsets + np.maximum(k_span // 2, 0)
+        
+            # Noise radius grows with the segment length, but is at least 1.
+            noise_radius = np.maximum(k_span // 4, 1)
+        
+            # Sample integer noise in [-noise_radius, noise_radius].
+            noise = np.array([
+                np.random.randint(-r, r + 1) for r in noise_radius
+            ])
+        
+            k_offsets = np.clip(midpoint_offsets + noise, i_offsets, j_offsets - 1)
+
         else:
             raise ValueError(f'Unknown subgoal_strategy: {subgoal_strategy}')
 
