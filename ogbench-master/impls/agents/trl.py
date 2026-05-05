@@ -595,8 +595,9 @@ def get_config():
 
             # NEW: TRL subgoal sampling strategy.
             # 'uniform' = original TRL baseline from the paper (i.e. what we already had)
-            # 'midpoint' = smarter-subgoal extension
-            subgoal_strategy='uniform',
+            # 'midpoint' = smarter-subgoal extension 1
+            # 'noisy_midpoint' = smarter-subgoal extension 2
+            subgoal_strategy='uniform', # Options: 'uniform', 'midpoint', 'noisy_midpoint'.
 
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
             value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
