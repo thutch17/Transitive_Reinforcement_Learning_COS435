@@ -70,16 +70,21 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         def reduce_critic_output(values, leg_lengths):
             # If critic output has an ensemble dimension, take the conservative min.
-            # Normal case:
-            #   values: (ensemble, batch), leg_lengths: (batch,)
-            # Candidate flattened case:
-            #   values: (ensemble, batch*num_candidates),
-            #   leg_lengths: (batch*num_candidates,)
             if values.ndim > leg_lengths.ndim:
                 return jnp.min(values, axis=0)
             return values
 
         discount = self.config['discount']
+
+        # oracle-distillation fix:
+        # when oracle distillation is enabled, critic/target_critic expect raw observation goals.
+        goal_key_k = 'g_k_obs' if self.config['use_oracle_distillation'] else 'g_k'
+        goal_key_j = 'g_j_obs' if self.config['use_oracle_distillation'] else 'g_j'
+        goal_key_k_candidates = (
+            'g_k_obs_candidates'
+            if self.config['use_oracle_distillation']
+            else 'g_k_candidates'
+        )
 
         use_candidate_max = (
             self.config.get('subgoal_strategy', 'uniform') == 'candidate_max'
@@ -94,9 +99,9 @@ class TRLAgent(flax.struct.PyTreeNode):
             #
             # We flatten to:
             #   (batch * num_candidates, dim)
-            # so target_critic sees an ordinary 2D batch, like in the original TRL path.
-            batch_size = batch['g_k_candidates'].shape[0]
-            num_candidates = batch['g_k_candidates'].shape[1]
+            # so target_critic sees an ordinary 2D batch.
+            batch_size = batch[goal_key_k_candidates].shape[0]
+            num_candidates = batch[goal_key_k_candidates].shape[1]
 
             # Repeat start state/action and final goal across candidate dimension.
             s_i = jnp.repeat(
@@ -110,7 +115,7 @@ class TRLAgent(flax.struct.PyTreeNode):
                 axis=1,
             )
             g_j = jnp.repeat(
-                jnp.expand_dims(batch['g_j'], axis=1),
+                jnp.expand_dims(batch[goal_key_j], axis=1),
                 repeats=num_candidates,
                 axis=1,
             )
@@ -122,7 +127,7 @@ class TRLAgent(flax.struct.PyTreeNode):
 
             s_k = batch['s_k_candidates'].reshape((batch_size * num_candidates, -1))
             a_k = batch['a_k_candidates'].reshape((batch_size * num_candidates, -1))
-            g_k = batch['g_k_candidates'].reshape((batch_size * num_candidates, -1))
+            g_k = batch[goal_key_k_candidates].reshape((batch_size * num_candidates, -1))
 
             leg1_len = batch['leg1_len_candidates'].reshape((batch_size * num_candidates,))
             leg2_len = batch['leg2_len_candidates'].reshape((batch_size * num_candidates,))
@@ -133,8 +138,8 @@ class TRLAgent(flax.struct.PyTreeNode):
             a_i = batch['a_i']
             s_k = batch['s_k']
             a_k = batch['a_k']
-            g_j = batch['g_j']
-            g_k = batch['g_k']
+            g_j = batch[goal_key_j]
+            g_k = batch[goal_key_k]
             leg1_len = batch['leg1_len']
             leg2_len = batch['leg2_len']
 
@@ -166,12 +171,6 @@ class TRLAgent(flax.struct.PyTreeNode):
             second_leg_labels,
         )
 
-        # Candidate-max path:
-        #   target_labels starts as shape (batch*num_candidates,)
-        #   reshape to (batch, num_candidates), then max over candidates.
-        #
-        # Single-subgoal path:
-        #   target_labels is shape (batch,)
         target_labels = first_leg_labels * second_leg_labels
 
         if use_candidate_max:
@@ -333,8 +332,10 @@ class TRLAgent(flax.struct.PyTreeNode):
         # For consistancy's sake I labeled what goes into the expectile loss as "logits" and what goes into the distance weight as "labels"
 
         # 1. Evaluate the student critic on Q(s_i, a_i, g_j)
+        # oracle-distillation fix: use raw observation goals when distilling.
+        goal_key = 'g_j_obs' if self.config['use_oracle_distillation'] else 'g_j'
         critic_logits = self.network.select('critic')(
-            batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
+            batch['s_i'], batch[goal_key], batch['a_i'], params=grad_params
         )
         if critic_logits.ndim > batch['leg1_len'].ndim:
             critic_logits = jnp.min(critic_logits, axis=0)
@@ -353,7 +354,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # is using oracle distillation, also compute distillation loss and add to critic loss
         if self.config['use_oracle_distillation']:
             oracle_logits = self.network.select('oracle_critic')(
-                batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
+                batch['s_i'], batch['g_j_obs'], batch['a_i'], params=grad_params
             )
 
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
@@ -400,7 +401,8 @@ class TRLAgent(flax.struct.PyTreeNode):
             actions = dist.sample(seed=rng)
 
             # step 2
-            q_vals = self.network.select('critic')(
+            critic_module = 'oracle_critic' if self.config['use_oracle_distillation'] else 'critic'
+            q_vals = self.network.select(critic_module)(
                 batch['s_i'], batch['g_j'], actions
             )
             # again take min? this can change but want conservative updates
@@ -436,7 +438,8 @@ class TRLAgent(flax.struct.PyTreeNode):
 
             pred = self.network.select('actor')(batch['s_i'], batch['g_j'], x_t, t, params = grad_params)
 
-            q_vals = self.network.select('critic')(batch['s_i'], batch['g_j'], batch['a_i'])
+            critic_module = 'oracle_critic' if self.config['use_oracle_distillation'] else 'critic'
+            q_vals = self.network.select(critic_module)(batch['s_i'], batch['g_j'], batch['a_i'])
             if q_vals.ndim > batch['leg1_len'].ndim:
                 q_vals = jnp.min(q_vals, axis=0)
 
@@ -501,8 +504,11 @@ class TRLAgent(flax.struct.PyTreeNode):
         )
 
         # 4. Write new target parameters and return updated network.
-        new_params = network.params.copy()
-        new_params[f'modules_target_{module_name}'] = new_target_params
+        # 4. Write new target parameters and return updated network.
+        new_params = {
+            k: new_target_params if k == f'modules_target_{module_name}' else v
+            for k, v in network.params.items()
+        }
         return network.replace(params=new_params)
 
     @jax.jit
@@ -588,7 +594,8 @@ class TRLAgent(flax.struct.PyTreeNode):
             n_actions = jnp.clip(n_actions, -1, 1) # clip actions to be in action space
 
             # Always use main critic for policy extraction (never use oracle_critic which is for training distillation only)
-            q = self.network.select('critic')(n_obs, goals=n_goals, actions=n_actions) # evaluate Q for all sampled actions
+            critic_module = 'oracle_critic' if self.config['use_oracle_distillation'] else 'critic'
+            q = self.network.select(critic_module)(n_obs, goals=n_goals, actions=n_actions) # evaluate Q for all sampled actions
             if q.ndim > n_actions.ndim - 1:
                 q = jnp.min(q, axis=0)
 
@@ -707,12 +714,17 @@ class TRLAgent(flax.struct.PyTreeNode):
             )
             ex_actor_input = (ex_observations, ex_goals, ex_actions, ex_times)
 
+        #oracle-distillation fix:
+        # when using oracle distillation, critic/target_critic are initialized
+        # with raw observation goals so their input dimensions match g_j_obs/g_k_obs.
+        ex_critic_goals = ex_observations if config['use_oracle_distillation'] else ex_goals
+
         # 4. Initialize network parameters
         network_info = dict(
             actor=(actor_def, ex_actor_input),
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            oracle_critic = (oracle_critic_def, (ex_observations, ex_goals, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
+            critic=(critic_def, (ex_observations, ex_critic_goals, ex_actions)),
+            oracle_critic=(oracle_critic_def, (ex_observations, ex_goals, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_critic_goals, ex_actions)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -721,8 +733,9 @@ class TRLAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
                 
         # 5. Initialize critic and target critic with same parameters
-        params = network_params
-        params['modules_target_critic'] = params['modules_critic']
+        # Unfreeze params if it is a FrozenDict to allow mutation.
+        network_params = dict(network_params)
+        network_params['modules_target_critic'] = network_params['modules_critic']
 
         # 6. Initialize optimizers
         network_tx = optax.adam(learning_rate=config['lr'])
