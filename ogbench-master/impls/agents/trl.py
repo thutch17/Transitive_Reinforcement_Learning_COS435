@@ -354,7 +354,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # is using oracle distillation, also compute distillation loss and add to critic loss
         if self.config['use_oracle_distillation']:
             oracle_logits = self.network.select('oracle_critic')(
-                batch['s_i'], batch['g_j_obs'], batch['a_i'], params=grad_params
+                batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
             )
 
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
