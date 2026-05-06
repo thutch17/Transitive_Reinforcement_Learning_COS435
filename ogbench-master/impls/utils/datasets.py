@@ -509,8 +509,10 @@ class TRLDataset:
             'a_k': self.actions[k_idxs],
             # goal representations (oracle rep when available, else full-state obs)
             'g_i': goals[i_idxs],
-            'g_j': goals[j_idxs],
+            'g_j': goals[j_idxs],  # oracle rep if available, else observations
+            'g_j_obs': self.observations[j_idxs],  # always raw observations
             'g_k': goals[k_idxs],
+            'g_k_obs': self.observations[k_idxs],
             'leg1_len': k_idxs - i_idxs,
             'leg2_len': j_idxs - k_idxs,
         }
