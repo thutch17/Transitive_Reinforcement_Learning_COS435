@@ -576,11 +576,15 @@ class TRLDataset:
             's_k': self.observations[k_idxs],
             'a_k': self.actions[k_idxs],
     
-            # goal representations (oracle rep when available, else full-state obs)
+            # goal representations.
+            # g_* uses oracle reps if available, else full-state observations.
+            # g_*_obs always uses raw observations, needed for oracle-distillation dimension handling.
             'g_i': goals[i_idxs],
             'g_j': goals[j_idxs],
             'g_k': goals[k_idxs],
-    
+            'g_j_obs': self.observations[j_idxs],
+            'g_k_obs': self.observations[k_idxs],
+
             # lengths of the two transitive chunks
             'leg1_len': k_idxs - i_idxs,
             'leg2_len': j_idxs - k_idxs,
@@ -593,6 +597,7 @@ class TRLDataset:
                 's_k_candidates': self.observations[candidate_idxs],
                 'a_k_candidates': self.actions[candidate_idxs],
                 'g_k_candidates': goals[candidate_idxs],
+                'g_k_obs_candidates': self.observations[candidate_idxs],
                 'leg1_len_candidates': candidate_idxs - i_idxs[:, None],
                 'leg2_len_candidates': j_idxs[:, None] - candidate_idxs,
             })
