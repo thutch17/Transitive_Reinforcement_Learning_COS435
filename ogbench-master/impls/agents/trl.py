@@ -189,7 +189,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # is using oracle distillation, also compute distillation loss and add to critic loss
         if self.config['use_oracle_distillation']:
             oracle_logits = self.network.select('oracle_critic')(
-                batch['s_i'], batch['g_j_obs'], batch['a_i'], params=grad_params
+                batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
             )
 
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
@@ -548,7 +548,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             ex_actor_input = (ex_observations, ex_goals, ex_actions, ex_times)
 
         # 4. Initialize network parameters
-        # When using oracle distillation, critic learns from oracle goals, oracle_critic from learned goals
+        # When using oracle distillation, the critic and oracle critic intentionally see different goal inputs.
         ex_critic_goals = ex_observations if config['use_oracle_distillation'] else ex_goals
         network_info = dict(
             actor=(actor_def, ex_actor_input),
@@ -563,7 +563,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
                 
         # 5. Initialize critic and target critic with same parameters
-        # Unfreeze params if it's a FrozenDict to allow mutation
+        # unfreeze params if it's a FrozenDict to allow mutation (a bug fix from the original paper)
         network_params = dict(network_params)
         network_params['modules_target_critic'] = network_params['modules_critic']
 
