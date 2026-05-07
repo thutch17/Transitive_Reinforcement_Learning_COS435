@@ -65,14 +65,8 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 1. Get subgoal batch
         subgoal_batch = batch
 
-        def reduce_critic_output(values): # today I learned you can define a function inside a function in python, who knew
-            # Identify critic in ensemble with most conservative target estimate
-            if values.ndim > subgoal_batch['leg1_len'].ndim:
-                return jnp.min(values, axis=0)
-            return values
-
         discount = self.config['discount']
-        
+
         # Select goal keys based on oracle distillation
         goal_key_k = 'g_k_obs' if self.config['use_oracle_distillation'] else 'g_k'
         goal_key_j = 'g_j_obs' if self.config['use_oracle_distillation'] else 'g_j'
@@ -82,13 +76,12 @@ class TRLAgent(flax.struct.PyTreeNode):
         first_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_i'], subgoal_batch[goal_key_k], subgoal_batch['a_i']
         )
-        first_leg_logits = reduce_critic_output(first_leg_logits)
-
+        # keep [2, B] so each ensemble member gets its own target (matches reference impl)
         first_leg_labels = jax.nn.sigmoid(first_leg_logits)
 
         first_leg_labels = jnp.where(
-            subgoal_batch['leg1_len'] <= 1,
-            discount ** subgoal_batch['leg1_len'],
+            (subgoal_batch['leg1_len'] <= 1)[None, ...],
+            discount ** subgoal_batch['leg1_len'][None, ...],
             first_leg_labels,
         )
 
@@ -97,14 +90,12 @@ class TRLAgent(flax.struct.PyTreeNode):
         second_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_k'], subgoal_batch[goal_key_j], subgoal_batch['a_k']
         )
-
-        second_leg_logits = reduce_critic_output(second_leg_logits)
-
+        # keep [2, B] so each ensemble member gets its own target (matches reference impl)
         second_leg_labels = jax.nn.sigmoid(second_leg_logits)
 
         second_leg_labels = jnp.where(
-            subgoal_batch['leg2_len'] <= 1,
-            discount ** subgoal_batch['leg2_len'],
+            (subgoal_batch['leg2_len'] <= 1)[None, ...],
+            discount ** subgoal_batch['leg2_len'][None, ...],
             second_leg_labels,
         )
 
@@ -172,8 +163,6 @@ class TRLAgent(flax.struct.PyTreeNode):
         critic_logits = self.network.select('critic')(
             batch['s_i'], batch[goal_key], batch['a_i'], params=grad_params
         )
-        if critic_logits.ndim > batch['leg1_len'].ndim:
-            critic_logits = jnp.min(critic_logits, axis=0)
 
         # 2. Evaluate the target critic on \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
         target_labels = self.transitive_target(batch)
