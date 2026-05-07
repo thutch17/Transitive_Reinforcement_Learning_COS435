@@ -27,17 +27,6 @@ def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, com
         'terminals', and 'next_observations' (if `compact_dataset` is False) or 'valids' (if `compact_dataset` is True).
         If `add_info` is True, the dictionary may also contain additional keys for observation information.
     """
-    ### DEBUG CODE
-
-    '''print("DATASET PATH:", dataset_path)
-    print("EXISTS:", os.path.exists(dataset_path))
-    print("SIZE:", os.path.getsize(dataset_path))
-
-    with open(dataset_path, "rb") as f:
-        print("HEADER:", f.read(4))''';
-
-    ### end debug code
-
 
     file = np.load(dataset_path)
 
