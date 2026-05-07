@@ -76,7 +76,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         first_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_i'], subgoal_batch[goal_key_k], subgoal_batch['a_i']
         )
-        # keep [2, B] so each ensemble member gets its own target (matches reference impl)
+        # keep [2, B] so each ensemble member gets its own target
         first_leg_labels = jax.nn.sigmoid(first_leg_logits)
 
         first_leg_labels = jnp.where(
@@ -90,7 +90,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         second_leg_logits = self.network.select('target_critic')(
             subgoal_batch['s_k'], subgoal_batch[goal_key_j], subgoal_batch['a_k']
         )
-        # keep [2, B] so each ensemble member gets its own target (matches reference impl)
+        # keep [2, B] so each ensemble member gets its own target
         second_leg_labels = jax.nn.sigmoid(second_leg_logits)
 
         second_leg_labels = jnp.where(
@@ -102,7 +102,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         # 4. Return the product of the target logits of the two trajectory chunks
         return first_leg_labels * second_leg_labels
 
-    def distance_weight(self, critic_logits):
+    def distance_weight(self, target_labels):
         """Reweight samples so short chunks matter more b/c get bad cumluating bias if don't
 
         The accuracy of the target value for a longer trajectory chunk (s_i to
@@ -111,7 +111,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         distance-based re-weighting, in which the loss for each sample (s_i, s_j)
         is weighted by the factor:
             w(s_i, s_j) = (1 + \log_{\gamma} Q(s_i, a_i, s_j))^{-\lambda}
-        
+
         The resulting weight for each trajectory chunk is (roughly) inversely
         proportional to its estimated distance, yielding a higher weight to
         shorter trajectory chunks.
@@ -120,18 +120,17 @@ class TRLAgent(flax.struct.PyTreeNode):
         1. convert the critic prediction into an estimated distance
         """
         lam = self.config['distance_weight_lambda']
-        critic_labels = jax.nn.sigmoid(critic_logits)
-        
+
         # 1. If \lambda = 0: return 1 for every sample
         if lam == 0.0:
-            return jnp.ones_like(critic_labels)
-        
-        # 1.5. The clipping isn't stricly neccesary but would help with numerical stability
-        critic_labels_clipped = jnp.clip(critic_labels, a_min=1e-8, a_max=1.0 - 1e-8)
+            return jnp.ones_like(target_labels)
+
+        # use target (stop-gradiented transitive product) instead of prediction for stable weights
+        target_clipped = jnp.clip(target_labels, a_min=1e-8, a_max=1.0 - 1e-8)
 
         # 2. Compute \log_{\gamma} Q(s_i, a_i, s_j)
-        estimated_distance = jnp.log(critic_labels_clipped) / jnp.log(self.config['discount']) #this looks fine to me...
-        
+        estimated_distance = jax.lax.stop_gradient(jnp.log(target_clipped) / jnp.log(self.config['discount']))
+
         # 3. Compute distance-based re-weights
         weights = 1.0 / ((1.0 + estimated_distance) ** lam)
 
@@ -172,7 +171,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         expectile_loss = self.expectile_loss(critic_logits=critic_logits, target_labels=target_labels)
 
         # 4. Compute distance-based re-weighted loss
-        weights = self.distance_weight(critic_logits=critic_logits)
+        weights = self.distance_weight(target_labels=target_labels)
         critic_loss = (expectile_loss * weights).mean()
 
         # is using oracle distillation, also compute distillation loss and add to critic loss
