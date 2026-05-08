@@ -545,7 +545,6 @@ class TRLAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
                 
         # 5. Initialize critic and target critic with same parameters
-        # unfreeze params if it's a FrozenDict to allow mutation (minor bug fix from the original paper)
         network_params = dict(network_params)
         network_params['modules_target_critic'] = network_params['modules_critic']
 
