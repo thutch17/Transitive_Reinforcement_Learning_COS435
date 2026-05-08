@@ -14,13 +14,19 @@ The original OGBench README has also been preserved for reference.
 
 Our implementation of TRL can be found at:
 
-`ogbench-master/impls/trl.py`
+`ogbench-master/impls/agents/trl.py`
+
+### Main File
+
+The primary script used to run TRL experiments is:
+
+`ogbench-master/impls/main.py`
 
 ### Hyperparameter Shell Files
 
 We used multiple shell files to run different experiments. These can be found under:
 
-`ogbench-master/utils`
+`ogbench-master/impls`
 
 The primary files are:
 
