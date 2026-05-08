@@ -62,6 +62,39 @@ Other notebooks, such as `trl_pointmaze_colab` and `trl_pointmaze_results`, were
 
 ### `smarter-subgoals`
 
-This branch was used to develop extensions and modifications to the original TRL algorithm intended to improve performance.
+This branch was used to develop our extensions and modifications to the original TRL algorithm, focusing on alternative in-trajectory subgoal selection strategies intended to improve long-horizon value propagation.
 
-Most files are organized similarly to the `main` branch.
+Most files are organized similarly to the `main` branch. The main training entry point can still be found at:
+
+`text
+ogbench-master/impls/main.py`
+
+and the TRL agent implementation can be found at:
+
+`ogbench-master/impls/agents/trl.py`
+
+The main differentiator is that this branch adds configurable flags for choosing the TRL subgoal selection strategy.
+
+`--agent.subgoal_strategy`
+
+Options:
+- uniform          # original TRL behavior: uniformly sample an in-trajectory subgoal. Is the default.
+- midpoint         # choose the midpoint subgoal between i and j
+- noisy_midpoint   # choose a subgoal from a local window around the midpoint
+- candidate_max    # choose the best subgoal among several in-trajectory candidates
+
+For the candidate_max strategy, this branch also supports: `--agent.subgoal_num_candidates`
+
+This controls how many valid in-trajectory candidate subgoals are considered before taking the maximum transitive target.
+
+The evaluation and smoke-test scripts for these extensions are located in:
+`ogbench-master/impls/`
+
+Relevant files include:
+- `eval_hyperparameters_midpoint.sh`
+- `eval_hyperparameters_noisy_midpoint.sh`
+- `eval_hyperparameters_candidate_max.sh`
+
+- `test_hyperparams_midpoint.sh`
+- `test_hyperparams_noisy_midpoint.sh`
+- `test_hyperparams_candidate_max.sh`
