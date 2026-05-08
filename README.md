@@ -34,14 +34,16 @@ The primary files are:
   - Used for smoke testing to ensure the algorithm functions correctly before running long evaluations.
 
 - `eval_hyperparameters.sh`
-  - Used for benchmarking on OGBench to reproduce results from Park et al. (2026) as well as evaluate several novel environments.
+  - Used for benchmarking on OGBench to reproduce results from Park et al. 2026 as well as evaluate several novel environments.
 
 - `ablation_hyperparameters.sh`
-  - Used for ablation studies reproducing results from Park et al.
+  - Used for ablation studies reproducing results from Park et al. 2026
 
 ### Data Collection Notebooks
 
-We also used several Python/Colab notebooks to collect and visualize results.
+We also used several Python/Colab notebooks to collect and visualize results. These can be found under:
+
+`python_notebooks`
 
 The most important notebooks are:
 
