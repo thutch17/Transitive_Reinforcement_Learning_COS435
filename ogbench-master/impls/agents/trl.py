@@ -55,29 +55,18 @@ class TRLAgent(flax.struct.PyTreeNode):
 
     def transitive_target(self, batch):
         """Compute the TRL target value.
-
+    
         Baseline / midpoint / noisy_midpoint:
             target = Qbar(s_i, a_i, s_k) * Qbar(s_k, a_k, s_j)
-
+    
         candidate_max:
-            We receive several candidate subgoals k_m from the dataset and compute:
-                target_m = Qbar(s_i, a_i, s_{k_m}) * Qbar(s_{k_m}, a_{k_m}, s_j)
-            Then we take max_m target_m.
-
-        This approximates the max-over-subgoals structure of the transitive Bellman
-        update while restricting candidates to in-trajectory behavioral subgoals.
+            Compute the transitive target for multiple candidate subgoals, then
+            take the max over candidates. We preserve the critic ensemble dimension
+            so the online critic loss can train each ensemble head separately.
         """
-
-        def reduce_critic_output(values, leg_lengths):
-            # If critic output has an ensemble dimension, take the conservative min.
-            if values.ndim > leg_lengths.ndim:
-                return jnp.min(values, axis=0)
-            return values
-
         discount = self.config['discount']
-
-        # oracle-distillation fix:
-        # when oracle distillation is enabled, critic/target_critic expect raw observation goals.
+    
+        # When oracle distillation is enabled, critic/target_critic use raw observation goals.
         goal_key_k = 'g_k_obs' if self.config['use_oracle_distillation'] else 'g_k'
         goal_key_j = 'g_j_obs' if self.config['use_oracle_distillation'] else 'g_j'
         goal_key_k_candidates = (
@@ -85,25 +74,17 @@ class TRLAgent(flax.struct.PyTreeNode):
             if self.config['use_oracle_distillation']
             else 'g_k_candidates'
         )
-
+    
         use_candidate_max = (
             self.config.get('subgoal_strategy', 'uniform') == 'candidate_max'
             and 'g_k_candidates' in batch
         )
-
+    
         if use_candidate_max:
-            # Candidate tensors start with shape:
-            #   s_k_candidates: (batch, num_candidates, obs_dim)
-            #   a_k_candidates: (batch, num_candidates, action_dim)
-            #   g_k_candidates: (batch, num_candidates, goal_dim)
-            #
-            # We flatten to:
-            #   (batch * num_candidates, dim)
-            # so target_critic sees an ordinary 2D batch.
             batch_size = batch[goal_key_k_candidates].shape[0]
             num_candidates = batch[goal_key_k_candidates].shape[1]
-
-            # Repeat start state/action and final goal across candidate dimension.
+    
+            # Repeat start state/action and final goal across candidates.
             s_i = jnp.repeat(
                 jnp.expand_dims(batch['s_i'], axis=1),
                 repeats=num_candidates,
@@ -119,21 +100,20 @@ class TRLAgent(flax.struct.PyTreeNode):
                 repeats=num_candidates,
                 axis=1,
             )
-
+    
             # Flatten candidate dimension into batch dimension.
             s_i = s_i.reshape((batch_size * num_candidates, -1))
             a_i = a_i.reshape((batch_size * num_candidates, -1))
             g_j = g_j.reshape((batch_size * num_candidates, -1))
-
+    
             s_k = batch['s_k_candidates'].reshape((batch_size * num_candidates, -1))
             a_k = batch['a_k_candidates'].reshape((batch_size * num_candidates, -1))
             g_k = batch[goal_key_k_candidates].reshape((batch_size * num_candidates, -1))
-
+    
             leg1_len = batch['leg1_len_candidates'].reshape((batch_size * num_candidates,))
             leg2_len = batch['leg2_len_candidates'].reshape((batch_size * num_candidates,))
-
+    
         else:
-            # Original single-subgoal path.
             s_i = batch['s_i']
             a_i = batch['a_i']
             s_k = batch['s_k']
@@ -142,41 +122,48 @@ class TRLAgent(flax.struct.PyTreeNode):
             g_k = batch[goal_key_k]
             leg1_len = batch['leg1_len']
             leg2_len = batch['leg2_len']
-
-        # First trajectory chunk:
-        # If k - i <= 1: Qbar(s_i, a_i, s_k) = gamma^(k-i)
+    
+        # First trajectory chunk.
         first_leg_logits = self.network.select('target_critic')(
             s_i, g_k, a_i
         )
-        first_leg_logits = reduce_critic_output(first_leg_logits, leg1_len)
+    
+        # IMPORTANT: do NOT min-reduce here.
+        # Keep shape (num_ensembles, batch) if target_critic is an ensemble.
         first_leg_labels = jax.nn.sigmoid(first_leg_logits)
-
+    
         first_leg_labels = jnp.where(
-            leg1_len <= 1,
-            discount ** leg1_len,
+            (leg1_len <= 1)[None, ...] if first_leg_labels.ndim > leg1_len.ndim else (leg1_len <= 1),
+            discount ** (leg1_len[None, ...] if first_leg_labels.ndim > leg1_len.ndim else leg1_len),
             first_leg_labels,
         )
-
-        # Second trajectory chunk:
-        # If j - k <= 1: Qbar(s_k, a_k, s_j) = gamma^(j-k)
+    
+        # Second trajectory chunk.
         second_leg_logits = self.network.select('target_critic')(
             s_k, g_j, a_k
         )
-        second_leg_logits = reduce_critic_output(second_leg_logits, leg2_len)
+    
+        # IMPORTANT: do NOT min-reduce here either.
         second_leg_labels = jax.nn.sigmoid(second_leg_logits)
-
+    
         second_leg_labels = jnp.where(
-            leg2_len <= 1,
-            discount ** leg2_len,
+            (leg2_len <= 1)[None, ...] if second_leg_labels.ndim > leg2_len.ndim else (leg2_len <= 1),
+            discount ** (leg2_len[None, ...] if second_leg_labels.ndim > leg2_len.ndim else leg2_len),
             second_leg_labels,
         )
-
+    
         target_labels = first_leg_labels * second_leg_labels
-
+    
         if use_candidate_max:
-            target_labels = target_labels.reshape((batch_size, num_candidates))
-            target_labels = jnp.max(target_labels, axis=1)
-
+            # If no ensemble: (batch*num_candidates,) -> (batch, num_candidates)
+            # If ensemble:   (E, batch*num_candidates) -> (E, batch, num_candidates)
+            if target_labels.ndim == 1:
+                target_labels = target_labels.reshape((batch_size, num_candidates))
+                target_labels = jnp.max(target_labels, axis=1)
+            else:
+                target_labels = target_labels.reshape((target_labels.shape[0], batch_size, num_candidates))
+                target_labels = jnp.max(target_labels, axis=2)
+    
         return target_labels
 
     # def transitive_target(self, batch):
@@ -275,94 +262,80 @@ class TRLAgent(flax.struct.PyTreeNode):
     #         target_labels = jnp.max(target_labels, axis=1)
     
     #     return target_labels
-
-    def distance_weight(self, critic_logits):
-        """Reweight samples so short chunks matter more b/c get bad cumluating bias if don't
-
-        The accuracy of the target value for a longer trajectory chunk (s_i to
-        s_j) depends on the accuracy of the target values for the two shorter
-        trajectory chunks (s_i to s_k and s_k to s_j). Section 4.3.1 proposes
-        distance-based re-weighting, in which the loss for each sample (s_i, s_j)
-        is weighted by the factor:
-            w(s_i, s_j) = (1 + \log_{\gamma} Q(s_i, a_i, s_j))^{-\lambda}
-        
-        The resulting weight for each trajectory chunk is (roughly) inversely
-        proportional to its estimated distance, yielding a higher weight to
-        shorter trajectory chunks.
-
-        pseudocode:
-        1. convert the critic prediction into an estimated distance
+    
+    def distance_weight(self, target_labels):
+        """Compute distance-based reweighting from the transitive target.
+    
+        This matches the reference implementation more closely: estimate distance
+        from the target value, not from the online critic prediction, and stop
+        gradients through the distance weights.
         """
         lam = self.config['distance_weight_lambda']
-        critic_labels = jax.nn.sigmoid(critic_logits)
-        
-        # 1. If \lambda = 0: return 1 for every sample
+    
         if lam == 0.0:
-            return jnp.ones_like(critic_labels)
-        
-        # 1.5. The clipping isn't stricly neccesary but would help with numerical stability
-        critic_labels_clipped = jnp.clip(critic_labels, a_min=1e-8, a_max=1.0 - 1e-8)
-
-        # 2. Compute \log_{\gamma} Q(s_i, a_i, s_j)
-        estimated_distance = jnp.log(critic_labels_clipped) / jnp.log(self.config['discount']) #this looks fine to me...
-        
-        # 3. Compute distance-based re-weights
+            return jnp.ones_like(target_labels)
+    
+        target_clipped = jnp.clip(target_labels, a_min=1e-8, a_max=1.0 - 1e-8)
+    
+        estimated_distance = jax.lax.stop_gradient(
+            jnp.log(target_clipped) / jnp.log(self.config['discount'])
+        )
+    
         weights = 1.0 / ((1.0 + estimated_distance) ** lam)
-
-        # 4. Return distance-based re-weights
         return weights
-
+    
     def critic_loss(self, batch, grad_params):
         """Compute the TRL critic/value loss.
-
-        Section 4.3.1 defines the value loss as (Equation 11):
-            L^{TRL}(Q) = E_{\tau \sim D}[
-                w(s_i, s_j) * D_{\kappa}(
-                    Q(s_i, a_i, s_j), \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
-                )
-            ]
-        where D is the expectile variant of the binary cross-entropy loss.
+    
+        Key implementation details:
+        - Do NOT min-reduce the online critic before the loss.
+        - Keep critic_logits and target_labels ensemble-shaped when possible.
+        - Compute distance weights from target_labels, not critic_logits.
         """
-        # NOTE (regarding logits vs. labels):     
-        # After doing some searching, you need to feed in logits to the expectile loss
-        # for the sigmoid binary cross-entropy loss to be well-behaved
-        # but for the distance based reweighing you need to convert to labels
-        # so that inputs are in (0, 1) and the loss is well-behaved. 
-        # In general, if something looks like it should be a probability or bounded between 0 and 1, it probably is a label
-        # For consistancy's sake I labeled what goes into the expectile loss as "logits" and what goes into the distance weight as "labels"
-
-        # 1. Evaluate the student critic on Q(s_i, a_i, g_j)
-        # oracle-distillation fix: use raw observation goals when distilling.
+        # Main critic uses raw observation goals under oracle distillation.
         goal_key = 'g_j_obs' if self.config['use_oracle_distillation'] else 'g_j'
+    
         critic_logits = self.network.select('critic')(
             batch['s_i'], batch[goal_key], batch['a_i'], params=grad_params
         )
-        if critic_logits.ndim > batch['leg1_len'].ndim:
-            critic_logits = jnp.min(critic_logits, axis=0)
-
-        # 2. Evaluate the target critic on \bar{Q}(s_i, a_i, s_k) * \bar{Q}(s_k, a_k, s_j)
+    
+        # IMPORTANT:
+        # Do NOT do:
+        #   critic_logits = jnp.min(critic_logits, axis=0)
+        # here. The online critic ensemble should be trained head-by-head.
+    
         target_labels = self.transitive_target(batch)
-
-        # 3. Compute the expectile variant of the binary cross-entropy loss between
-        #    the online critic prediction and target critic
-        expectile_loss = self.expectile_loss(critic_logits=critic_logits, target_labels=target_labels)
-
-        # 4. Compute distance-based re-weighted loss
-        weights = self.distance_weight(critic_logits=critic_logits)
+    
+        expectile_loss = self.expectile_loss(
+            critic_logits=critic_logits,
+            target_labels=target_labels,
+        )
+    
+        weights = self.distance_weight(target_labels=target_labels)
         critic_loss = (expectile_loss * weights).mean()
-
-        # is using oracle distillation, also compute distillation loss and add to critic loss
+    
+        oracle_distill_loss = jnp.array(0.0)
+        oracle_pred_mean = jnp.array(0.0)
+        oracle_pred_max = jnp.array(0.0)
+        oracle_pred_min = jnp.array(0.0)
+    
         if self.config['use_oracle_distillation']:
+            # Oracle critic uses oracle-representation goals.
             oracle_logits = self.network.select('oracle_critic')(
                 batch['s_i'], batch['g_j'], batch['a_i'], params=grad_params
             )
-
+    
             oracle_distill_loss = optax.sigmoid_binary_cross_entropy(
-                oracle_logits, jax.lax.stop_gradient(jax.nn.sigmoid(critic_logits))
+                oracle_logits,
+                jax.lax.stop_gradient(jax.nn.sigmoid(critic_logits)),
             ).mean()
-
+    
             critic_loss = critic_loss + oracle_distill_loss
-
+    
+            oracle_pred_mean = oracle_logits.mean()
+            oracle_pred_max = oracle_logits.max()
+            oracle_pred_min = oracle_logits.min()
+    
         return critic_loss, {
             'critic_loss': critic_loss,
             'pred_mean': critic_logits.mean(),
@@ -372,6 +345,10 @@ class TRLAgent(flax.struct.PyTreeNode):
             'target_max': target_labels.max(),
             'target_min': target_labels.min(),
             'weight_mean': weights.mean(),
+            'oracle_distill_loss': oracle_distill_loss,
+            'oracle_pred_mean': oracle_pred_mean,
+            'oracle_pred_max': oracle_pred_max,
+            'oracle_pred_min': oracle_pred_min,
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
