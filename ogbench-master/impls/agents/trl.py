@@ -266,7 +266,7 @@ class TRLAgent(flax.struct.PyTreeNode):
     def distance_weight(self, target_labels):
         """Compute distance-based reweighting from the transitive target.
     
-        This matches the reference implementation more closely: estimate distance
+        This matches the main file's (on the main branch) implementation more closely: estimate distance
         from the target value, not from the online critic prediction, and stop
         gradients through the distance weights.
         """
@@ -287,7 +287,7 @@ class TRLAgent(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params):
         """Compute the TRL critic/value loss.
     
-        Key implementation details:
+        Key implementation ideas I think:
         - Do NOT min-reduce the online critic before the loss.
         - Keep critic_logits and target_labels ensemble-shaped when possible.
         - Compute distance weights from target_labels, not critic_logits.
@@ -367,7 +367,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         4. maximize that objective, or equivalently minimize its negative
         5. return the actor loss and logging stats
 
-        This should branch for the rejection sampling policy extraction method, but that is not currently implemented.
+        This should branch for the rejection sampling policy extraction method in theory
         """
         if self.config['policy_extraction'] == 'ddpgbc':
             # step 1
