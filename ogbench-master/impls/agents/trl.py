@@ -228,7 +228,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             q_vals = self.network.select(critic_module)(
                 batch['s_i'], batch['g_j'], actions
             )
-            # again take min? this can change but want conservative updates
+            # take min to ensure conservative updates
             if q_vals.ndim > batch['leg1_len'].ndim:
                 q_vals = jnp.min(q_vals, axis=0)
 
@@ -453,14 +453,13 @@ class TRLAgent(flax.struct.PyTreeNode):
         - equation (11) needs an online critic and a target critic
         - section 4.3.2 needs a policy module for extraction
         """
-        print("Update: TRLAgent.create is being called v1")
         
         # 1. Initialize the RNG key
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
         # 2. Define action dimension from example observations
-        # Use provided example goals when available; fall back to observations.
+        # use provided example goals when available; otherwise fall back to observations.
         ex_goals = ex_goals if ex_goals is not None else ex_observations
         ex_times = ex_actions[..., :1]
         if config['discrete']:
@@ -470,11 +469,6 @@ class TRLAgent(flax.struct.PyTreeNode):
 
         # FLAGGED: TRL datasets are state-based, not pixel-based. Revisit if 
         #    we expand our set of environments to "visual-<ENV>"
-        # encoders = dict()
-        # if config['encoder'] is not None:
-        #     encoder_module = encoder_modules[config['encoder']]
-        #     encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
-        #     encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
 
         # 3. Define actor-critic network
         if config['discrete']: # do we need this?
@@ -536,7 +530,7 @@ class TRLAgent(flax.struct.PyTreeNode):
             ex_actor_input = (ex_observations, ex_goals, ex_actions, ex_times)
 
         # 4. Initialize network parameters
-        # When using oracle distillation, the critic and oracle critic intentionally see different goal inputs.
+        # when using oracle distillation, the critic and oracle critic see different goal inputs.
         ex_critic_goals = ex_observations if config['use_oracle_distillation'] else ex_goals
         network_info = dict(
             actor=(actor_def, ex_actor_input),
@@ -551,7 +545,7 @@ class TRLAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
                 
         # 5. Initialize critic and target critic with same parameters
-        # unfreeze params if it's a FrozenDict to allow mutation (a bug fix from the original paper)
+        # unfreeze params if it's a FrozenDict to allow mutation (minor bug fix from the original paper)
         network_params = dict(network_params)
         network_params['modules_target_critic'] = network_params['modules_critic']
 

@@ -20,7 +20,7 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_vi
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('run_group', 'Evaluation_2', 'Run group.') # make sure to set different run groups for different experiments to avoid confusion in WandB
+flags.DEFINE_string('run_group', 'Evaluation', 'Run group.') # make sure to set different run groups for different experiments to avoid confusion in WandB
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
@@ -36,7 +36,7 @@ flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for 
 flags.DEFINE_integer('eval_episodes', 10, 'Number of episodes for each task.') # originally 20, changed to 10 to speed up evaluation (TRL implementation did 15)
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
-flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.') # set to 0 to avoid OOM on GPU, we will handle video rendering separately
+flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.') # set to 0 to avoid OOM on GPU
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 

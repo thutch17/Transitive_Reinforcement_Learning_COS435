@@ -1,3 +1,5 @@
+# this is the collection of all hyperparameters used for the OGBench-implemented algorithms, and was not used
+
 # pointmaze-medium-navigate-v0 (GCBC)
 python main.py --env_name=pointmaze-medium-navigate-v0 --eval_episodes=50 --agent=agents/gcbc.py
 # pointmaze-medium-navigate-v0 (GCIVL)
